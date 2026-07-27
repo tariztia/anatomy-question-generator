@@ -185,14 +185,25 @@ payloads/{paper_id}/
 
 ## Configuración de los modelos
 
-Los modelos de OpenRouter se definen al inicio de cada etapa:
+Los modelos de OpenRouter se configuran con variables de entorno (en el `.env` o en
+la línea de comandos), con la constante de cada etapa como valor por defecto:
 
-- **Generador**: constante `MODELO_GENERADOR` en `etapa1_generador.py`
-- **Evaluador**: constante `MODELO_EVALUADOR` en `etapa2_evaluador.py`
+- **Generador**: `MODELO_GENERADOR` (constante en `etapa1_generador.py`)
+- **Evaluador**: `MODELO_EVALUADOR` (constante en `etapa2_evaluador.py`)
 
-Puedes cambiarlos por cualquier slug disponible en <https://openrouter.ai/models>.
+```bash
+MODELO_GENERADOR=anthropic/claude-opus-4-7 MODELO_EVALUADOR=google/gemini-3.1-pro make pipeline
+```
+
+**Usa siempre modelos de familias distintas.** Si el generador y el evaluador son el
+mismo modelo, la etapa 2 es una autoevaluación: el modelo aprueba sus propios errores
+(evidencias parafraseadas, respuestas no unívocas) y el control de veracidad deja de
+funcionar. El pipeline emite un `WARNING` al arrancar cuando detecta esta situación.
+
+Puedes usar cualquier slug disponible en <https://openrouter.ai/models>.
 Ten en cuenta que los modelos grandes (p. ej. Claude Opus) cuestan bastante más por
-token y requieren más saldo que los modelos pequeños o `:free`.
+token y requieren más saldo que los modelos pequeños o `:free`. Ambas etapas envían
+imágenes, así que los dos modelos deben ser multimodales.
 
 ---
 

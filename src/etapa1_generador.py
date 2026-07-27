@@ -7,37 +7,93 @@ con el feedback del evaluador).
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
-from openrouter_client import OpenRouterClient
+from openrouter_client import OpenRouterClient  # carga el .env al importarse
 from schemas import PaquetePaper, PreguntaGenerada, SalidaGenerador
 
 logger = logging.getLogger(__name__)
 
-# "anthropic/claude-opus-4-7"   
-# "google/gemma-4-31b-it:free"
+# Configurable con la variable de entorno MODELO_GENERADOR (o en el .env).
+# DEBE ser distinto de MODELO_EVALUADOR: si un modelo se evalúa a sí mismo,
+# aprueba sus propios errores. Recomendado en producción:
+#   MODELO_GENERADOR=anthropic/claude-opus-4-7   (multimodal fuerte)
+# Otras opciones probadas: "google/gemma-4-31b-it:free", "openai/gpt-4o-mini".
 
-MODELO_GENERADOR = "google/gemma-4-31b-it:free"
+MODELO_GENERADOR = os.getenv("MODELO_GENERADOR", "openai/gpt-4o-mini")
 TEMPERATURA = 0.7
 MAX_CHARS_TEXTO = 60_000  # recorte defensivo del texto del paper
 
 SYSTEM_PROMPT = """\
-Eres un experto en anatomía humana y en diseño de evaluaciones. Generas \
-preguntas de estudio a partir de papers académicos de anatomía.
+Eres un experto en anatomía humana y en diseño de evaluaciones. Usas papers \
+académicos como FUENTE DE CONOCIMIENTO para escribir preguntas de ANATOMÍA \
+GENERAL. No escribes preguntas SOBRE el paper.
 
-REGLAS ESTRICTAS:
-1. Genera EXACTAMENTE 15 preguntas.
-2. Todas son preguntas ABIERTAS BREVES: la respuesta es un término, estructura, \
-condición o concepto puntual de 1 a 5 palabras. NO generes preguntas de alternativas, \
-NO de verdadero/falso, NO de desarrollo.
-3. AL MENOS 5 preguntas deben referirse a figuras del paper (tipo "imagen").
-4. Cada pregunta debe incluir la EVIDENCIA que respalda la respuesta: una cita \
-textual del paper o una referencia explícita a una figura.
-5. Si "tipo" es "imagen", "figura_id" DEBE ser el id de una figura real del \
+PRINCIPIO RECTOR: quien responde nunca ha visto el paper y nunca lo verá. Cada \
+pregunta debe tener sentido tal cual en un examen de anatomía de cualquier \
+universidad. El paper solo te sirve para saber qué es anatómicamente cierto y \
+para aportarte las imágenes.
+
+PROHIBIDO (descarta la pregunta y escribe otra):
+- Mencionar el estudio, sus autores, su muestra o su método ("en este estudio", \
+"según los autores", "la serie analizada", "en la tomografía realizada").
+- Preguntar por resultados estadísticos del estudio: porcentajes, prevalencias, \
+n, medias, rangos o medidas de la muestra. Ejemplos de lo que NO debes generar: \
+"¿Qué porcentaje presentó el tronco hepatogástrico?", "¿Cuál es la longitud \
+media del tronco celíaco?", "¿Cuál fue la distancia media entre X e Y?".
+- Preguntar por una figura como objeto de la pregunta: "¿Qué figura muestra X?", \
+"¿En cuál de las imágenes se ve Y?". Una figura NUNCA es la respuesta.
+- Que la respuesta sea un número tomado del paper, un id de figura ("fig_3") o \
+"Figura 2".
+
+PREGUNTAS DE TIPO "imagen" (las más valiosas):
+La figura es el ESTÍMULO de la pregunta, jamás la respuesta. Quien responde ve \
+la imagen y el enunciado, nada más.
+- Patrones correctos: "¿Qué estructura señala la punta de flecha?", "¿Qué \
+variante anatómica se observa en la imagen?", "¿De qué vaso nace la estructura \
+que cruza la línea media?", "¿Qué territorio quedaría isquémico si se ocluyera \
+el vaso más grueso de la imagen?", "¿Qué órgano se vería comprometido por un \
+trombo en la estructura señalada?".
+- Debe ser IMPOSIBLE responder sin mirar la imagen. Si el enunciado por sí solo \
+basta para responder, es una pregunta de texto mal etiquetada.
+- Refiérete a la imagen como "la imagen" o "la figura", NUNCA por su número.
+- Solo puedes apuntar a marcas que REALMENTE existan en esa imagen (flechas, \
+punteros, etiquetas, calipers). Si no las hay, localiza la estructura en \
+términos anatómicos o de posición ("el vaso más superior", "la estructura que \
+cruza la línea media").
+- No preguntes por valores escritos sobre la imagen (mediciones, texto del \
+equipo): eso se lee, no se razona.
+- Si una figura no permite una pregunta honesta y respondible desde la imagen \
+(es un gráfico, una tabla o es ilegible), NO la uses.
+
+CONTENIDO Y VARIEDAD de las 15 preguntas:
+- Mezcla ejes: identificación de estructuras, origen/trayecto/ramas, relaciones \
+espaciales (anterior, posterior, medial, superior), variantes anatómicas y su \
+nombre propio, y correlato clínico-quirúrgico ("qué se lesionaría si...", "qué \
+se infartaría si...").
+- Al menos 4 preguntas de dificultad "alta", que exijan razonar (consecuencia \
+funcional, relación espacial, distinguir una variante de la disposición \
+habitual), no recordar un dato.
+- No repitas la misma estructura como respuesta más de dos veces.
+- Usa nomenclatura anatómica estándar (Terminologia Anatomica) en español.
+
+REGLAS DE FORMATO:
+1. Genera EXACTAMENTE 15 preguntas, con pregunta_id de "q_01" a "q_15".
+2. Todas son ABIERTAS BREVES: la respuesta es un término, estructura, variante \
+o concepto puntual de 1 a 5 palabras. NO alternativas, NO verdadero/falso, NO \
+desarrollo.
+3. AL MENOS 5 preguntas de tipo "imagen", si hay al menos 5 figuras aptas.
+4. Si "tipo" es "imagen", "figura_id" DEBE ser el id de una figura real del \
 input (por ejemplo "fig_1"). Si "tipo" es "texto", "figura_id" debe ser null.
-6. La respuesta debe ser correcta, unívoca y verificable con la evidencia.
-7. Las preguntas deben ser autocontenidas (entendibles sin ver el paper).
+5. La respuesta debe ser UNÍVOCA: si un estudiante informado pudiera dar otra \
+respuesta igualmente válida, reformula la pregunta hasta que solo quepa una.
+6. EVIDENCIA: cita TEXTUAL y literal del paper, en su idioma original, copiada \
+carácter por carácter. Nunca traduzcas ni parafrasees. Prefiere pasajes de \
+introducción o discusión que describan anatomía general, no filas de resultados. \
+Para preguntas de imagen: la cita literal del caption MÁS una descripción de qué \
+se ve en la imagen que justifica la respuesta.
 
 Devuelve ÚNICAMENTE un objeto JSON válido, sin texto adicional, con este \
 formato:
@@ -64,7 +120,18 @@ marcadas como corregibles por un evaluador, junto con el feedback específico. \
 Corrige cada pregunta respetando el feedback.
 
 REGLAS ESTRICTAS (idénticas a la generación):
-- Preguntas ABIERTAS BREVES, respuesta de 1 a 5 palabras.
+- Las preguntas son de ANATOMÍA GENERAL, no sobre el paper. Quien responde nunca \
+verá el paper. Prohibido mencionar el estudio, su muestra o su método, y \
+prohibido preguntar por sus estadísticas (porcentajes, medias, prevalencias).
+- En las preguntas de tipo "imagen", la figura es el ESTÍMULO, nunca la \
+respuesta. Prohibido "¿Qué figura muestra X?" y prohibido responder con un id de \
+figura. Reformúlalas como "¿Qué estructura/variante se observa en la imagen?" o \
+como una consecuencia clínica de lo que se ve. Refiérete a la imagen como "la \
+imagen" o "la figura", nunca por su número, y solo apunta a marcas que \
+realmente existan en ella.
+- Preguntas ABIERTAS BREVES, respuesta de 1 a 5 palabras, unívoca.
+- Evidencia: cita literal del paper en su idioma original, sin traducir ni \
+parafrasear.
 - Mantén el mismo "pregunta_id" de cada pregunta que corriges.
 - Si el feedback indica ambigüedad, haz la pregunta más específica y unívoca.
 - Respeta las reglas de "tipo"/"figura_id"/"evidencia".
@@ -131,6 +198,9 @@ def generar_preguntas(
     ids_validos = paquete.figura_ids()
     instruccion = (
         "Genera ahora las 15 preguntas siguiendo TODAS las reglas. "
+        "Recuerda: son preguntas de anatomía general para alguien que nunca verá "
+        "este paper, y en las de tipo 'imagen' la figura es el estímulo, nunca "
+        "la respuesta. "
         f"Figuras válidas: {sorted(ids_validos) or 'ninguna'}."
     )
     contenido, image_refs = _construir_contenido_paper(paquete, instruccion, dir_figuras)

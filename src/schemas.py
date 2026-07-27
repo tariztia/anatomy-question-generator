@@ -80,6 +80,10 @@ class Calidad(BaseModel):
     clara: bool
     autocontenida: bool
     especificidad_adecuada: bool
+    # ¿Es una pregunta de anatomía general y no una pregunta sobre el paper?
+    independiente_del_paper: Optional[bool] = None
+    # Solo para tipo "imagen": la figura es el estímulo y no la respuesta.
+    imagen_como_estimulo: Optional[bool] = None
     comentario: Optional[str] = None
 
 

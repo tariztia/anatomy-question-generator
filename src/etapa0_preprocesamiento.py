@@ -26,18 +26,63 @@ CAPTION_RE = re.compile(r"^\s*(fig(?:ure|ura)?\.?\s*\d+)", re.IGNORECASE)
 MIN_ANCHO = 80
 MIN_ALTO = 80
 
+# Los metadatos de muchos PDFs traen el nombre del archivo del maquetador
+# (p. ej. "rb2015v48n6p358-362_en.p65") en lugar del título del paper.
+NOMBRE_ARCHIVO_RE = re.compile(r"\.(p65|pdf|docx?|indd|qxd|qxp|fm|tex|ai|eps)$", re.I)
+
+
+def _titulo_plausible(titulo: str) -> bool:
+    """Descarta nombres de archivo, códigos y fragmentos demasiado cortos."""
+    t = " ".join(titulo.split())
+    if len(t) < 15 or " " not in t:
+        return False
+    if NOMBRE_ARCHIVO_RE.search(t):
+        return False
+    letras = sum(1 for c in t if c.isalpha())
+    return letras >= 0.6 * len(t)
+
+
+def _titulo_por_fuente(pagina: fitz.Page) -> str:
+    """Reconstruye el título con los spans de mayor tamaño de fuente de la
+    mitad superior de la primera página (suele venir partido en varias líneas)."""
+    alto = pagina.rect.height or 1.0
+    spans: list[tuple[float, float, float, str]] = []  # (tamaño, y, x, texto)
+    for bloque in pagina.get_text("dict").get("blocks", []):
+        for linea in bloque.get("lines", []):
+            for span in linea.get("spans", []):
+                texto = " ".join(span.get("text", "").split())
+                if len(texto) < 2:  # asteriscos y marcas de nota al pie
+                    continue
+                x0, y0 = span["bbox"][0], span["bbox"][1]
+                if y0 > alto * 0.5:
+                    continue
+                spans.append((round(span.get("size", 0.0), 1), y0, x0, texto))
+
+    if not spans:
+        return ""
+    tam_max = max(s[0] for s in spans)
+    del_titulo = [s for s in spans if s[0] >= tam_max - 0.5]
+    del_titulo.sort(key=lambda s: (s[1], s[2]))  # orden de lectura
+    return " ".join(s[3] for s in del_titulo)
+
 
 def _titulo_desde_pdf(doc: fitz.Document, paper_id: str) -> str:
-    """Intenta el título de los metadatos; si no, la primera línea no vacía."""
-    meta_titulo = (doc.metadata or {}).get("title") or ""
-    if meta_titulo.strip():
-        return meta_titulo.strip()
+    """Título del paper, en orden de confianza: metadatos (si no son el nombre
+    del archivo), texto de mayor tamaño de la portada, primera línea del texto."""
+    candidatos = [(doc.metadata or {}).get("title") or ""]
 
     if doc.page_count:
-        texto = doc[0].get_text("text")
-        for linea in texto.splitlines():
+        candidatos.append(_titulo_por_fuente(doc[0]))
+        for linea in doc[0].get_text("text").splitlines():
             if len(linea.strip()) > 5:
-                return linea.strip()
+                candidatos.append(linea.strip())
+                break
+
+    for candidato in candidatos:
+        if _titulo_plausible(candidato):
+            return " ".join(candidato.split())
+
+    logger.warning("[%s] no se pudo determinar el título; se usa el paper_id", paper_id)
     return paper_id
 
 

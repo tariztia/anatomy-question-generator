@@ -8,18 +8,22 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
-from openrouter_client import OpenRouterClient
+from openrouter_client import OpenRouterClient  # carga el .env al importarse
 from schemas import PaquetePaper, PreguntaGenerada, SalidaEvaluador
 
 logger = logging.getLogger(__name__)
 
-# "google/gemini-3.1-pro"
-# "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+# Configurable con la variable de entorno MODELO_EVALUADOR (o en el .env).
+# DEBE ser de una familia distinta a MODELO_GENERADOR. Recomendado:
+#   MODELO_EVALUADOR=google/gemini-3.1-pro   (multimodal, buen seguimiento de rúbricas)
+# Otras opciones probadas:
+#   "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "openai/gpt-4o-mini".
 
-MODELO_EVALUADOR = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+MODELO_EVALUADOR = os.getenv("MODELO_EVALUADOR", "openai/gpt-4o-mini")
 TEMPERATURA = 0.0
 MAX_CHARS_TEXTO = 60_000
 
@@ -28,10 +32,17 @@ Eres un evaluador experto en anatomía humana. Recibes un paper y 15 preguntas \
 abiertas breves generadas a partir de él. Debes evaluar cada pregunta con \
 rigor y seleccionar las 10 mejores.
 
+Las preguntas alimentarán un dataset de entrenamiento de un modelo multimodal \
+de anatomía. El paper es solo la FUENTE del conocimiento y de las imágenes: las \
+preguntas deben ser de ANATOMÍA GENERAL, para alguien que nunca verá el paper. \
+Sé severo: una pregunta mediocre contamina el dataset, una pregunta menos no.
+
 Para CADA pregunta evalúa:
 
 1. VERACIDAD:
-   - evidencia_verificada: ¿la evidencia citada existe realmente en el paper?
+   - evidencia_verificada: ¿la evidencia citada aparece LITERALMENTE en el \
+paper, en su idioma original? Una paráfrasis o una traducción cuenta como NO \
+verificada.
    - respuesta_univoca: ¿la respuesta es correcta y ÚNICA? CRÍTICO: si la \
 pregunta admite múltiples respuestas válidas, respuesta_univoca=false y el \
 veredicto debe ser "corregible".
@@ -41,20 +52,39 @@ veredicto debe ser "corregible".
    - clara: ¿se entiende sin ambigüedad?
    - autocontenida: ¿se puede responder sin ver el paper?
    - especificidad_adecuada: ¿ni demasiado vaga ni demasiado trivial?
+   - independiente_del_paper: ¿es una pregunta de anatomía general? Pon false si \
+menciona el estudio, sus autores, su muestra o su método; si pregunta por una \
+estadística del estudio (porcentaje, prevalencia, n, media, rango, medida de la \
+muestra); si pregunta por una figura como objeto ("¿Qué figura muestra X?"); o \
+si la respuesta es un número del paper o un id de figura.
+   - imagen_como_estimulo: solo para tipo "imagen" (null si es "texto"). Pon \
+true únicamente si la figura es el ESTÍMULO y no la respuesta: es imposible \
+responder sin mirar la imagen, la respuesta es una estructura, variante o \
+consecuencia clínica (nunca "fig_N"), la imagen no se identifica por su número, \
+las marcas mencionadas (flechas, etiquetas, calipers) existen de verdad en ella, \
+y la respuesta no se limita a leer un texto o una medición impresa en la imagen.
 
-3. DIFICULTAD: reclasifícala de forma independiente ("baja"|"media"|"alta").
+3. DIFICULTAD: reclasifícala de forma independiente ("baja"|"media"|"alta"). Una \
+pregunta cuya respuesta se recita de memoria es "baja" por muy técnica que suene.
 
-Para preguntas de tipo "imagen", usa la figura correspondiente (te la paso con \
-su figura_id) para verificar que la respuesta se deduce de la imagen.
+Para preguntas de tipo "imagen", MIRA la figura correspondiente (te la paso con \
+su figura_id) y comprueba que la respuesta se deduce de la imagen y que lo que \
+el enunciado dice ver está realmente ahí.
 
 VEREDICTO por pregunta:
-   - "aprobada": veraz y de buena calidad.
-   - "corregible": tiene un defecto subsanable (p. ej. respuesta no unívoca, \
-poco específica). Incluye "feedback_correccion" con la instrucción concreta.
-   - "rechazada": defecto grave (evidencia inexistente, respuesta incorrecta).
+   - "aprobada": todos los criterios de veracidad y calidad en true.
+   - "corregible": defecto subsanable manteniendo la idea (respuesta no unívoca, \
+poco específica, evidencia parafraseada, o una pregunta de figura reformulable \
+como "¿qué estructura/variante se observa en la imagen?"). Incluye \
+"feedback_correccion" con la instrucción concreta de cómo reescribirla.
+   - "rechazada": defecto grave e insalvable: evidencia inexistente, respuesta \
+incorrecta, o la pregunta solo existe por ser un dato del estudio (una \
+estadística de la muestra no se puede convertir en pregunta de anatomía).
 
-SELECCIÓN FINAL: elige hasta 10 pregunta_ids, priorizando las "aprobada" de \
-mayor calidad y con buena cobertura de temas y figuras.
+SELECCIÓN FINAL: elige hasta 10 pregunta_ids, solo entre las "aprobada", \
+priorizando la mayor calidad, la variedad de temas y de ejes (identificación, \
+relaciones, variantes, correlato clínico) y una buena proporción de preguntas de \
+imagen. No completes la cuota con preguntas débiles.
 
 Devuelve ÚNICAMENTE un objeto JSON con este formato:
 {
@@ -63,7 +93,7 @@ Devuelve ÚNICAMENTE un objeto JSON con este formato:
     {
       "pregunta_id": "q_01",
       "veracidad": {"aprobada": true, "evidencia_verificada": true, "respuesta_univoca": true, "comentario": null},
-      "calidad": {"clara": true, "autocontenida": true, "especificidad_adecuada": true, "comentario": null},
+      "calidad": {"clara": true, "autocontenida": true, "especificidad_adecuada": true, "independiente_del_paper": true, "imagen_como_estimulo": null, "comentario": null},
       "dificultad_reclasificada": "media",
       "veredicto": "aprobada",
       "feedback_correccion": null

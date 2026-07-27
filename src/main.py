@@ -21,8 +21,8 @@ from pathlib import Path
 from typing import Optional
 
 from etapa0_preprocesamiento import preprocesar_carpeta
-from etapa1_generador import corregir_preguntas, generar_preguntas
-from etapa2_evaluador import evaluar_preguntas
+from etapa1_generador import MODELO_GENERADOR, corregir_preguntas, generar_preguntas
+from etapa2_evaluador import MODELO_EVALUADOR, evaluar_preguntas
 from etapa3_validacion import ValidacionError, construir_registro
 from openrouter_client import OpenRouterClient, OpenRouterError
 from schemas import Evaluacion, PaquetePaper, PreguntaGenerada, SalidaEvaluador
@@ -78,6 +78,9 @@ def procesar_paper(
     evaluaciones: dict[str, Evaluacion] = {
         e.pregunta_id: e for e in salida_eval.evaluaciones
     }
+    # Orden de preferencia propuesto por el evaluador (cobertura de temas,
+    # ejes y figuras). Se respeta en la selección final.
+    seleccion_sugerida: list[str] = list(salida_eval.seleccion_final.pregunta_ids)
     # intento en el que se generó cada pregunta (para metadata).
     intento_de: dict[str, int] = {pid: 1 for pid in preguntas}
 
@@ -153,13 +156,31 @@ def procesar_paper(
             break
         for e in reeval.evaluaciones:
             evaluaciones[e.pregunta_id] = e
+        seleccion_sugerida.extend(reeval.seleccion_final.pregunta_ids)
 
     # --- Selección final -----------------------------------------------
-    aprobadas_ids = [
+    # Se respeta el orden que propuso el evaluador (solo entre las aprobadas) y
+    # se completa con el resto de aprobadas si sugirió menos del objetivo.
+    aprobadas_ids = {
         pid for pid, e in evaluaciones.items() if e.veredicto == "aprobada"
-    ]
-    aprobadas_ids.sort()
-    seleccion = aprobadas_ids[:OBJETIVO_APROBADAS]
+    }
+    seleccion: list[str] = []
+    for pid in seleccion_sugerida:
+        if pid in aprobadas_ids and pid not in seleccion:
+            seleccion.append(pid)
+    ignoradas = [pid for pid in seleccion_sugerida if pid not in aprobadas_ids]
+    if ignoradas:
+        logger.debug(
+            "[%s] sugeridas por el evaluador pero no aprobadas: %s",
+            paquete.paper_id,
+            sorted(set(ignoradas)),
+        )
+    for pid in sorted(aprobadas_ids):
+        if len(seleccion) >= OBJETIVO_APROBADAS:
+            break
+        if pid not in seleccion:
+            seleccion.append(pid)
+    seleccion = seleccion[:OBJETIVO_APROBADAS]
 
     final = _contar_aprobadas(evaluaciones)
     if len(seleccion) < OBJETIVO_APROBADAS:
@@ -216,6 +237,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     _configurar_logging(args.verbose)
+
+    logger.info(
+        "Modelos: generador=%s | evaluador=%s", MODELO_GENERADOR, MODELO_EVALUADOR
+    )
+    if MODELO_GENERADOR == MODELO_EVALUADOR:
+        logger.warning(
+            "El generador y el evaluador son el MISMO modelo (%s): un modelo "
+            "evaluando su propia salida tiende a aprobar sus propios errores. "
+            "Usa modelos de familias distintas con las variables de entorno "
+            "MODELO_GENERADOR y MODELO_EVALUADOR.",
+            MODELO_GENERADOR,
+        )
 
     if not args.papers.is_dir():
         logger.error("La carpeta de papers no existe: %s", args.papers)
