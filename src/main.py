@@ -1,12 +1,14 @@
 """Orquestador del pipeline de generación de preguntas de anatomía.
 
-Ejecuta las 5 etapas para cada PDF de la carpeta Papers/ y produce
-dataset.jsonl.
+Ejecuta las 5 etapas para cada PDF de la carpeta de papers y produce un
+archivo de preguntas por paper en la carpeta de resultados. Para
+observabilidad, guarda además el request y la respuesta de cada llamada a
+un modelo en la carpeta de payloads.
 
 La OPENROUTER_API_KEY se lee del archivo .env (o de una variable de entorno).
-Uso:
+Uso (o usa el Makefile: `make pipeline` / `make pipeline-test`):
 
-    python main.py
+    python main.py                       # pipeline completo sobre Papers/
 """
 
 from __future__ import annotations
@@ -29,7 +31,8 @@ logger = logging.getLogger("pipeline")
 
 DIR_PAPERS = Path("Papers")
 DIR_FIGURAS = Path("figuras")
-ARCHIVO_SALIDA = Path("dataset.jsonl")
+DIR_PAYLOADS = Path("payloads")
+DIR_SALIDA = Path("resultados")
 
 OBJETIVO_APROBADAS = 10
 MAX_REINTENTOS = 2
@@ -51,19 +54,26 @@ def procesar_paper(
     client: OpenRouterClient,
     paquete: PaquetePaper,
     dir_figuras: Path,
+    dump_dir: Optional[Path] = None,
 ) -> list:
     """Ejecuta etapas 1, 2, 2.5 y 3 para un paper. Devuelve la lista de
-    registros (RegistroDataset) aprobados y validados."""
+    registros (RegistroDataset) aprobados y validados.
+
+    Si se pasa `dump_dir`, guarda ahí el request y la respuesta de cada
+    llamada a un modelo (observabilidad)."""
+
+    def _base(nombre: str) -> Optional[Path]:
+        return (dump_dir / nombre) if dump_dir is not None else None
 
     # --- Etapa 1: generación -------------------------------------------
-    salida_gen = generar_preguntas(client, paquete)
+    salida_gen = generar_preguntas(client, paquete, dir_figuras, _base("01_generador"))
     preguntas: dict[str, PreguntaGenerada] = {
         p.pregunta_id: p for p in salida_gen.preguntas
     }
 
     # --- Etapa 2: evaluación inicial -----------------------------------
     salida_eval: SalidaEvaluador = evaluar_preguntas(
-        client, paquete, list(preguntas.values())
+        client, paquete, list(preguntas.values()), dir_figuras, _base("02_evaluador")
     )
     evaluaciones: dict[str, Evaluacion] = {
         e.pregunta_id: e for e in salida_eval.evaluaciones
@@ -115,7 +125,10 @@ def procesar_paper(
         ]
 
         try:
-            corregidas = corregir_preguntas(client, paquete, payload)
+            corregidas = corregir_preguntas(
+                client, paquete, payload, dir_figuras,
+                _base(f"{2 * reintento + 1:02d}_correccion_r{reintento}"),
+            )
         except OpenRouterError as exc:
             logger.error("[%s] fallo en corrección: %s", paquete.paper_id, exc)
             break
@@ -131,7 +144,10 @@ def procesar_paper(
 
         # Re-evalúa SOLO las corregidas (Etapa 2 de nuevo).
         try:
-            reeval = evaluar_preguntas(client, paquete, corregidas)
+            reeval = evaluar_preguntas(
+                client, paquete, corregidas, dir_figuras,
+                _base(f"{2 * reintento + 2:02d}_evaluador_r{reintento}"),
+            )
         except OpenRouterError as exc:
             logger.error("[%s] fallo en re-evaluación: %s", paquete.paper_id, exc)
             break
@@ -192,7 +208,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Pipeline de preguntas de anatomía")
     parser.add_argument("--papers", type=Path, default=DIR_PAPERS)
     parser.add_argument("--figuras", type=Path, default=DIR_FIGURAS)
-    parser.add_argument("--salida", type=Path, default=ARCHIVO_SALIDA)
+    parser.add_argument("--salida-dir", type=Path, default=DIR_SALIDA,
+                        help="Carpeta de resultados; un .jsonl por paper")
+    parser.add_argument("--payloads-dir", type=Path, default=DIR_PAYLOADS,
+                        help="Carpeta de observabilidad; request y respuesta de cada modelo")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -208,7 +227,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not paquetes:
         logger.error("No hay papers para procesar. Fin.")
         return 1
-    logger.info("Preprocesados %d papers", len(paquetes))
+    logger.info(
+        "Preprocesados %d papers (imágenes en %s)", len(paquetes), args.figuras
+    )
 
     try:
         client = OpenRouterClient()
@@ -216,13 +237,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.error("%s", exc)
         return 1
 
+    args.salida_dir.mkdir(parents=True, exist_ok=True)
     ids_globales: set[str] = set()
     total = 0
-    with client, args.salida.open("w", encoding="utf-8") as fh:
+    with client:
         for paquete in paquetes:
             logger.info("========== Paper: %s ==========", paquete.paper_id)
+            dump_dir = args.payloads_dir / paquete.paper_id
             try:
-                registros = procesar_paper(client, paquete, args.figuras)
+                registros = procesar_paper(client, paquete, args.figuras, dump_dir)
             except OpenRouterError as exc:
                 logger.error("[%s] error de API, se omite el paper: %s", paquete.paper_id, exc)
                 continue
@@ -230,26 +253,25 @@ def main(argv: Optional[list[str]] = None) -> int:
                 logger.exception("[%s] error inesperado, se omite: %s", paquete.paper_id, exc)
                 continue
 
-            for registro in registros:
-                # Unicidad global de pregunta_id entre papers.
-                if registro.pregunta_id in ids_globales:
-                    logger.warning(
-                        "pregunta_id duplicado global %s, se omite",
-                        registro.pregunta_id,
-                    )
-                    continue
-                ids_globales.add(registro.pregunta_id)
-                fh.write(
-                    json.dumps(
-                        registro.model_dump(), ensure_ascii=False
-                    )
-                    + "\n"
-                )
-                total += 1
+            # Un archivo de preguntas por paper: resultados/{paper_id}.jsonl
+            ruta_salida = args.salida_dir / f"{paquete.paper_id}.jsonl"
+            escritos = 0
+            with ruta_salida.open("w", encoding="utf-8") as fh:
+                for registro in registros:
+                    # Unicidad global de pregunta_id entre papers.
+                    if registro.pregunta_id in ids_globales:
+                        logger.warning(
+                            "pregunta_id duplicado global %s, se omite",
+                            registro.pregunta_id,
+                        )
+                        continue
+                    ids_globales.add(registro.pregunta_id)
+                    fh.write(json.dumps(registro.model_dump(), ensure_ascii=False) + "\n")
+                    escritos += 1
+            total += escritos
+            logger.info("[%s] %d preguntas escritas en %s", paquete.paper_id, escritos, ruta_salida)
 
-            logger.info("[%s] %d registros escritos", paquete.paper_id, len(registros))
-
-    logger.info("=== Listo. %d preguntas escritas en %s ===", total, args.salida)
+    logger.info("=== Listo. %d preguntas escritas en %s ===", total, args.salida_dir)
     return 0
 
 

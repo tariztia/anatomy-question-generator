@@ -7,6 +7,7 @@ con el feedback del evaluador).
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Optional
 
 from openrouter_client import OpenRouterClient
@@ -14,7 +15,10 @@ from schemas import PaquetePaper, PreguntaGenerada, SalidaGenerador
 
 logger = logging.getLogger(__name__)
 
-MODELO_GENERADOR = "anthropic/claude-opus-4-7"
+# "anthropic/claude-opus-4-7"   
+# "google/gemma-4-31b-it:free"
+
+MODELO_GENERADOR = "google/gemma-4-31b-it:free"
 TEMPERATURA = 0.7
 MAX_CHARS_TEXTO = 60_000  # recorte defensivo del texto del paper
 
@@ -71,9 +75,10 @@ Incluye SOLO las preguntas corregidas."""
 
 
 def _construir_contenido_paper(
-    paquete: PaquetePaper, instruccion_final: str
-) -> list[dict[str, Any]]:
-    """Construye el contenido multimodal: texto del paper + figuras."""
+    paquete: PaquetePaper, instruccion_final: str, dir_figuras: Path
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Construye el contenido multimodal (texto + figuras) y el mapa de
+    referencias imagen->ruta PNG para el volcado de observabilidad."""
     texto = paquete.texto_completo[:MAX_CHARS_TEXTO]
 
     partes: list[dict[str, Any]] = [
@@ -83,6 +88,7 @@ def _construir_contenido_paper(
             f"=== TEXTO DEL PAPER ===\n{texto}\n"
         )
     ]
+    image_refs: dict[str, str] = {}
 
     if paquete.figuras:
         partes.append(
@@ -98,7 +104,11 @@ def _construir_contenido_paper(
                     f"[{fig.figura_id}] (página {fig.pagina}) caption: {fig.caption or '(sin caption)'}"
                 )
             )
-            partes.append(OpenRouterClient.image_part(fig.imagen_base64))
+            parte_img = OpenRouterClient.image_part(fig.imagen_base64)
+            partes.append(parte_img)
+            image_refs[parte_img["image_url"]["url"]] = str(
+                dir_figuras / f"{paquete.paper_id}_{fig.figura_id}.png"
+            )
     else:
         partes.append(
             OpenRouterClient.text_part(
@@ -108,11 +118,14 @@ def _construir_contenido_paper(
         )
 
     partes.append(OpenRouterClient.text_part("\n" + instruccion_final))
-    return partes
+    return partes, image_refs
 
 
 def generar_preguntas(
-    client: OpenRouterClient, paquete: PaquetePaper
+    client: OpenRouterClient,
+    paquete: PaquetePaper,
+    dir_figuras: Path,
+    dump_base: Optional[Path] = None,
 ) -> SalidaGenerador:
     """Genera las 15 preguntas para un paper."""
     ids_validos = paquete.figura_ids()
@@ -120,7 +133,7 @@ def generar_preguntas(
         "Genera ahora las 15 preguntas siguiendo TODAS las reglas. "
         f"Figuras válidas: {sorted(ids_validos) or 'ninguna'}."
     )
-    contenido = _construir_contenido_paper(paquete, instruccion)
+    contenido, image_refs = _construir_contenido_paper(paquete, instruccion, dir_figuras)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -132,6 +145,8 @@ def generar_preguntas(
         model=MODELO_GENERADOR,
         messages=messages,
         temperature=TEMPERATURA,
+        dump_base=dump_base,
+        image_refs=image_refs,
     )
     data.setdefault("paper_id", paquete.paper_id)
     salida = SalidaGenerador.model_validate(data)
@@ -149,6 +164,8 @@ def corregir_preguntas(
     client: OpenRouterClient,
     paquete: PaquetePaper,
     preguntas_a_corregir: list[dict[str, Any]],
+    dir_figuras: Path,
+    dump_base: Optional[Path] = None,
 ) -> list[PreguntaGenerada]:
     """Reenvía preguntas corregibles al generador con el feedback del
     evaluador. Devuelve la lista de preguntas corregidas."""
@@ -169,7 +186,7 @@ def corregir_preguntas(
         f"Figuras válidas: {sorted(ids_validos) or 'ninguna'}.\n\n"
         "PREGUNTAS A CORREGIR:\n" + "\n".join(lineas)
     )
-    contenido = _construir_contenido_paper(paquete, instruccion)
+    contenido, image_refs = _construir_contenido_paper(paquete, instruccion, dir_figuras)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT_CORRECCION},
@@ -185,6 +202,8 @@ def corregir_preguntas(
         model=MODELO_GENERADOR,
         messages=messages,
         temperature=TEMPERATURA,
+        dump_base=dump_base,
+        image_refs=image_refs,
     )
     data.setdefault("paper_id", paquete.paper_id)
     salida = SalidaGenerador.model_validate(data)

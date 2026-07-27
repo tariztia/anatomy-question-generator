@@ -7,10 +7,12 @@ chat completions de OpenAI.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -74,9 +76,17 @@ class OpenRouterClient:
         temperature: float = 0.7,
         response_format_json: bool = True,
         max_tokens: Optional[int] = None,
+        dump_base: Optional[Path] = None,
+        image_refs: Optional[dict[str, str]] = None,
     ) -> str:
         """Ejecuta una completion y devuelve el contenido de texto de la
-        respuesta. Reintenta ante errores transitorios (429 / 5xx / red)."""
+        respuesta. Reintenta ante errores transitorios (429 / 5xx / red).
+
+        Si `dump_base` se pasa, guarda para observabilidad:
+          - `{dump_base}.request.json`  — el payload enviado (imágenes
+            reemplazadas por su ruta en disco según `image_refs`).
+          - `{dump_base}.response.json` — la respuesta cruda del modelo.
+        """
 
         payload: dict[str, Any] = {
             "model": model,
@@ -87,6 +97,16 @@ class OpenRouterClient:
             payload["response_format"] = {"type": "json_object"}
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+
+        if dump_base is not None:
+            _escribir_json(
+                Path(f"{dump_base}.request.json"),
+                {
+                    "model": model,
+                    "temperature": temperature,
+                    "messages": _sanitizar_messages(messages, image_refs),
+                },
+            )
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -108,7 +128,13 @@ class OpenRouterClient:
                     )
                 resp.raise_for_status()
                 data = resp.json()
-                return data["choices"][0]["message"]["content"]
+                content = data["choices"][0]["message"]["content"]
+                if dump_base is not None:
+                    _escribir_json(
+                        Path(f"{dump_base}.response.json"),
+                        {"model": model, "respuesta": _quizas_json(content)},
+                    )
+                return content
             except (httpx.HTTPStatusError, httpx.TransportError, KeyError, json.JSONDecodeError) as exc:
                 ultimo_error = exc
                 espera = min(2 ** intento, 30)
@@ -133,6 +159,8 @@ class OpenRouterClient:
         messages: list[dict[str, Any]],
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
+        dump_base: Optional[Path] = None,
+        image_refs: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
         """Como chat() pero parsea la respuesta como JSON. Tolera bloques
         ```json ... ``` que algunos modelos añaden."""
@@ -142,6 +170,8 @@ class OpenRouterClient:
             temperature=temperature,
             response_format_json=True,
             max_tokens=max_tokens,
+            dump_base=dump_base,
+            image_refs=image_refs,
         )
         return _parse_json_laxo(raw)
 
@@ -153,6 +183,43 @@ class OpenRouterClient:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+
+def _escribir_json(path: Path, obj: Any) -> None:
+    """Escribe `obj` como JSON legible, creando la carpeta si hace falta."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _quizas_json(raw: str) -> Any:
+    """Devuelve el contenido parseado como JSON si se puede; si no, el texto
+    crudo. Sirve para que la respuesta guardada sea legible."""
+    try:
+        return _parse_json_laxo(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw
+
+
+def _sanitizar_messages(
+    messages: list[dict[str, Any]], image_refs: Optional[dict[str, str]]
+) -> list[dict[str, Any]]:
+    """Copia los mensajes reemplazando cada imagen (data URL base64) por una
+    referencia al PNG en disco, para que el JSON guardado sea legible."""
+    refs = image_refs or {}
+    out = copy.deepcopy(messages)
+    for msg in out:
+        contenido = msg.get("content")
+        if not isinstance(contenido, list):
+            continue
+        for parte in contenido:
+            if isinstance(parte, dict) and parte.get("type") == "image_url":
+                url = parte.get("image_url", {}).get("url", "")
+                if url.startswith("data:"):
+                    ref = refs.get(url)
+                    parte["image_url"] = (
+                        {"_archivo": ref} if ref else {"_imagen_omitida": True}
+                    )
+    return out
 
 
 def _parse_json_laxo(raw: str) -> dict[str, Any]:

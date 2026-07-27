@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
 from openrouter_client import OpenRouterClient
 from schemas import PaquetePaper, PreguntaGenerada, SalidaEvaluador
 
 logger = logging.getLogger(__name__)
 
-MODELO_EVALUADOR = "google/gemini-3.1-pro"
+# "google/gemini-3.1-pro"
+# "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+
+MODELO_EVALUADOR = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
 TEMPERATURA = 0.0
 MAX_CHARS_TEXTO = 60_000
 
@@ -97,6 +101,8 @@ def evaluar_preguntas(
     client: OpenRouterClient,
     paquete: PaquetePaper,
     preguntas: list[PreguntaGenerada],
+    dir_figuras: Path,
+    dump_base: Optional[Path] = None,
 ) -> SalidaEvaluador:
     """Evalúa las preguntas de un paper y devuelve la salida del evaluador."""
     texto = paquete.texto_completo[:MAX_CHARS_TEXTO]
@@ -108,6 +114,7 @@ def evaluar_preguntas(
             f"=== TEXTO DEL PAPER ===\n{texto}\n"
         )
     ]
+    image_refs: dict[str, str] = {}
 
     figuras = _figuras_referenciadas(paquete, preguntas)
     if figuras:
@@ -122,7 +129,11 @@ def evaluar_preguntas(
                     f"[{fig.figura_id}] (página {fig.pagina}) caption: {fig.caption or '(sin caption)'}"
                 )
             )
-            partes.append(OpenRouterClient.image_part(fig.imagen_base64))
+            parte_img = OpenRouterClient.image_part(fig.imagen_base64)
+            partes.append(parte_img)
+            image_refs[parte_img["image_url"]["url"]] = str(
+                dir_figuras / f"{paquete.paper_id}_{fig.figura_id}.png"
+            )
 
     partes.append(
         OpenRouterClient.text_part(
@@ -142,6 +153,8 @@ def evaluar_preguntas(
         model=MODELO_EVALUADOR,
         messages=messages,
         temperature=TEMPERATURA,
+        dump_base=dump_base,
+        image_refs=image_refs,
     )
     data.setdefault("paper_id", paquete.paper_id)
     salida = SalidaEvaluador.model_validate(data)
