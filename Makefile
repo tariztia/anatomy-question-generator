@@ -6,12 +6,12 @@ PIP := ./.venv/bin/pip
 
 # --- Carpetas ---------------------------------------------------------------
 # Oficial
-PAPERS        := Papers
+PAPERS        := papers
 FIGURAS       := figuras
 PAYLOADS      := payloads
 RESULTADOS    := resultados
 # Test
-PAPERS_T      := Papers_test
+PAPERS_T      := papers_test
 FIGURAS_T     := figuras_test
 PAYLOADS_T    := payloads_test
 RESULTADOS_T  := resultados_test

@@ -8,7 +8,7 @@ un modelo en la carpeta de payloads.
 La OPENROUTER_API_KEY se lee del archivo .env (o de una variable de entorno).
 Uso (o usa el Makefile: `make pipeline` / `make pipeline-test`):
 
-    python main.py                       # pipeline completo sobre Papers/
+    python src/main.py                   # pipeline completo sobre papers/
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from schemas import Evaluacion, PaquetePaper, PreguntaGenerada, SalidaEvaluador
 
 logger = logging.getLogger("pipeline")
 
-DIR_PAPERS = Path("Papers")
+DIR_PAPERS = Path("papers")
 DIR_FIGURAS = Path("figuras")
 DIR_PAYLOADS = Path("payloads")
 DIR_SALIDA = Path("resultados")

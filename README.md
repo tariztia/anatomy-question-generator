@@ -57,15 +57,15 @@ Consigue tu key en <https://openrouter.ai/keys> y carga saldo en
 
 ## Uso
 
-Coloca los PDFs de entrada en la carpeta `Papers/` (o `Papers_test/` para pruebas) y
+Coloca los PDFs de entrada en la carpeta `papers/` (o `papers_test/` para pruebas) y
 usa los comandos del `Makefile`:
 
 | Comando | Qué hace | Entrada | Salida |
 |---------|----------|---------|--------|
 | `make help` | Lista los comandos disponibles | — | — |
 | `make install` | Crea `.venv` e instala las dependencias | — | `.venv/` |
-| `make pipeline` | **Pipeline completo** (etapas 0 → 3). Consume tokens de OpenRouter | `Papers/` | preguntas → `resultados/`, observabilidad → `payloads/`, imágenes → `figuras/` |
-| `make pipeline-test` | Pipeline completo sobre la carpeta de prueba | `Papers_test/` | preguntas → `resultados_test/`, observabilidad → `payloads_test/`, imágenes → `figuras_test/` |
+| `make pipeline` | **Pipeline completo** (etapas 0 → 3). Consume tokens de OpenRouter | `papers/` | preguntas → `resultados/`, observabilidad → `payloads/`, imágenes → `figuras/` |
+| `make pipeline-test` | Pipeline completo sobre la carpeta de prueba | `papers_test/` | preguntas → `resultados_test/`, observabilidad → `payloads_test/`, imágenes → `figuras_test/` |
 | `make clean` | Borra todas las salidas generadas (imágenes, payloads, resultados) | — | — |
 
 Las carpetas de salida se crean automáticamente; no hace falta crearlas a mano.
@@ -87,7 +87,7 @@ Los comandos del `Makefile` son atajos de `src/main.py`, que acepta estos flags:
 
 ```bash
 ./.venv/bin/python src/main.py \
-  --papers Papers \            # carpeta de PDFs de entrada
+  --papers papers \            # carpeta de PDFs de entrada
   --figuras figuras \          # carpeta donde guardar las imágenes
   --payloads-dir payloads \    # carpeta de observabilidad (request/respuesta por llamada)
   --salida-dir resultados \    # carpeta de resultados (un .jsonl por paper)
@@ -100,8 +100,8 @@ Los comandos del `Makefile` son atajos de `src/main.py`, que acepta estos flags:
 
 ```
 anatomy-question-generator/
-├── Papers/                 # PDFs de entrada (oficial)
-├── Papers_test/            # PDFs de entrada (prueba)
+├── papers/                 # PDFs de entrada (oficial)
+├── papers_test/            # PDFs de entrada (prueba)
 ├── figuras/                # imágenes extraídas (oficial)        [generado]
 ├── figuras_test/           # imágenes extraídas (prueba)         [generado]
 ├── payloads/               # observabilidad: request/respuesta   [generado]
