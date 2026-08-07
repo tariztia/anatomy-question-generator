@@ -36,7 +36,13 @@ N_SELECCION_MAX = 25
 # explícito y holgado porque el default del proveedor puede ser mucho menor, y
 # una respuesta truncada es JSON inválido que consume todos los reintentos.
 MAX_TOKENS_GENERADOR = 16_000
-MAX_TOKENS_EVALUADOR = 16_000
+
+# El evaluador necesita bastante más que el generador: en los modelos de
+# razonamiento los tokens de thinking cuentan contra max_tokens y no aparecen
+# en la respuesta. Medido con gemini-3.1-pro sobre un paper de 40 preguntas:
+# 9.149 tokens de razonamiento + ~10k de JSON, o sea que con 16.000 la
+# respuesta se cortaba a mitad de camino (finish_reason="length").
+MAX_TOKENS_EVALUADOR = 32_000
 
 
 def reparto_preguntas(n_figuras: int) -> tuple[int, int]:

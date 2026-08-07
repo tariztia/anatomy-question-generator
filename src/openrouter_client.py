@@ -36,6 +36,15 @@ class OpenRouterError(RuntimeError):
     """Error irrecuperable tras agotar reintentos."""
 
 
+class RespuestaTruncadaError(OpenRouterError):
+    """El modelo agotó max_tokens y devolvió una respuesta incompleta.
+
+    Se distingue del JSON inválido porque no tiene sentido reintentar con los
+    mismos parámetros: hay que subir max_tokens (ojo: en los modelos de
+    razonamiento los tokens de thinking también consumen ese presupuesto).
+    """
+
+
 class OpenRouterClient:
     def __init__(
         self,
@@ -128,11 +137,37 @@ class OpenRouterClient:
                     )
                 resp.raise_for_status()
                 data = resp.json()
-                content = data["choices"][0]["message"]["content"]
+                choice = data["choices"][0]
+                content = choice["message"]["content"]
+                finish_reason = choice.get("finish_reason")
+                uso = data.get("usage") or {}
                 if dump_base is not None:
+                    # finish_reason y usage se guardan siempre: sin ellos, una
+                    # respuesta truncada solo se ve como un JSON corrupto.
                     _escribir_json(
                         Path(f"{dump_base}.response.json"),
-                        {"model": model, "respuesta": _quizas_json(content)},
+                        {
+                            "model": model,
+                            "finish_reason": finish_reason,
+                            "usage": uso,
+                            "respuesta": _quizas_json(content),
+                        },
+                    )
+                if finish_reason == "length":
+                    razonamiento = (uso.get("completion_tokens_details") or {}).get(
+                        "reasoning_tokens"
+                    )
+                    raise RespuestaTruncadaError(
+                        f"El modelo {model} agotó max_tokens"
+                        + (f"={max_tokens}" if max_tokens is not None else "")
+                        + " y devolvió una respuesta incompleta"
+                        + (
+                            f" ({uso.get('completion_tokens')} tokens de salida, "
+                            f"{razonamiento} de razonamiento)"
+                            if razonamiento is not None
+                            else ""
+                        )
+                        + ". Sube el max_tokens de la etapa en config.py."
                     )
                 return content
             except (httpx.HTTPStatusError, httpx.TransportError, KeyError, json.JSONDecodeError) as exc:

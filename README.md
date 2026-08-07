@@ -198,7 +198,11 @@ payloads/{paper_id}/
   referencia al PNG real (`{"_archivo": "figuras/{paper_id}/fig_1.png"}`), que puedes abrir
   directamente. Esto no altera lo que se envía a OpenRouter, solo la copia en disco.
 - El `response.json` contiene la respuesta cruda del modelo (por ejemplo, los veredictos
-  completos del evaluador, que no aparecen en el resultado final).
+  completos del evaluador, que no aparecen en el resultado final), más el `finish_reason`
+  y el `usage` de la llamada. Un `finish_reason: "length"` significa que la respuesta se
+  cortó por `max_tokens`; en los modelos de razonamiento revisa
+  `usage.completion_tokens_details.reasoning_tokens`, porque el thinking consume ese mismo
+  presupuesto y no aparece en la respuesta.
 
 ---
 
