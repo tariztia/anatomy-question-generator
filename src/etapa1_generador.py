@@ -9,8 +9,10 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from string import Template
 from typing import Any, Optional
 
+import config
 from openrouter_client import OpenRouterClient  # carga el .env al importarse
 from schemas import PaquetePaper, PreguntaGenerada, SalidaGenerador
 
@@ -26,7 +28,7 @@ MODELO_GENERADOR = os.getenv("MODELO_GENERADOR", "openai/gpt-4o-mini")
 TEMPERATURA = 0.7
 MAX_CHARS_TEXTO = 60_000  # recorte defensivo del texto del paper
 
-SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT_TMPL = Template("""\
 Eres un experto en anatomía humana y en diseño de evaluaciones. Usas papers \
 académicos como FUENTE DE CONOCIMIENTO para escribir preguntas de ANATOMÍA \
 GENERAL. No escribes preguntas SOBRE el paper.
@@ -67,24 +69,33 @@ cruza la línea media").
 equipo): eso se lee, no se razona.
 - Si una figura no permite una pregunta honesta y respondible desde la imagen \
 (es un gráfico, una tabla o es ilegible), NO la uses.
+- Cada figura da pie a VARIAS preguntas (la instrucción final te dice cuántas \
+por figura). Esas preguntas deben atacar aspectos DISTINTOS de la imagen y \
+tener respuestas DISTINTAS entre sí: por ejemplo, una de identificación de una \
+estructura, otra de relación espacial con lo que la rodea y otra de \
+consecuencia clínica. Reformular la misma pregunta con otras palabras, o que \
+dos preguntas de la misma figura compartan respuesta, cuenta como repetición y \
+está prohibido.
 
-CONTENIDO Y VARIEDAD de las 15 preguntas:
+CONTENIDO Y VARIEDAD de las $n_generadas preguntas:
 - Mezcla ejes: identificación de estructuras, origen/trayecto/ramas, relaciones \
 espaciales (anterior, posterior, medial, superior), variantes anatómicas y su \
 nombre propio, y correlato clínico-quirúrgico ("qué se lesionaría si...", "qué \
 se infartaría si...").
-- Al menos 4 preguntas de dificultad "alta", que exijan razonar (consecuencia \
+- Al menos $n_alta preguntas de dificultad "alta", que exijan razonar (consecuencia \
 funcional, relación espacial, distinguir una variante de la disposición \
 habitual), no recordar un dato.
 - No repitas la misma estructura como respuesta más de dos veces.
 - Usa nomenclatura anatómica estándar (Terminologia Anatomica) en español.
 
 REGLAS DE FORMATO:
-1. Genera EXACTAMENTE 15 preguntas, con pregunta_id de "q_01" a "q_15".
+1. Genera EXACTAMENTE $n_generadas preguntas, con pregunta_id de "q_01" a "$id_max".
 2. Todas son ABIERTAS BREVES: la respuesta es un término, estructura, variante \
 o concepto puntual de 1 a 5 palabras. NO alternativas, NO verdadero/falso, NO \
 desarrollo.
-3. AL MENOS 5 preguntas de tipo "imagen", si hay al menos 5 figuras aptas.
+3. El número EXACTO de preguntas de tipo "imagen" y de tipo "texto", y cuántas \
+preguntas corresponden a cada figura, te los indica la instrucción final. \
+Respétalos al pie de la letra.
 4. Si "tipo" es "imagen", "figura_id" DEBE ser el id de una figura real del \
 input (por ejemplo "fig_1"). Si "tipo" es "texto", "figura_id" debe ser null.
 5. La respuesta debe ser UNÍVOCA: si un estudiante informado pudiera dar otra \
@@ -112,7 +123,14 @@ formato:
     }
   ]
 }
-Los pregunta_id van de "q_01" a "q_15"."""
+Los pregunta_id van de "q_01" a "$id_max"."""
+)
+
+SYSTEM_PROMPT = _SYSTEM_PROMPT_TMPL.substitute(
+    n_generadas=config.N_GENERADAS,
+    id_max=f"q_{config.N_GENERADAS:02d}",
+    n_alta=config.N_DIFICULTAD_ALTA,
+)
 
 SYSTEM_PROMPT_CORRECCION = """\
 Eres un experto en anatomía humana. Recibes preguntas que fueron rechazadas o \
@@ -179,8 +197,8 @@ def _construir_contenido_paper(
     else:
         partes.append(
             OpenRouterClient.text_part(
-                "\n(Este paper no tiene figuras extraídas; genera las 15 "
-                "preguntas de tipo 'texto'.)"
+                "\n(Este paper no tiene figuras extraídas; todas las preguntas "
+                "deben ser de tipo 'texto'.)"
             )
         )
 
@@ -194,13 +212,43 @@ def generar_preguntas(
     dir_figuras: Path,
     dump_base: Optional[Path] = None,
 ) -> SalidaGenerador:
-    """Genera las 15 preguntas para un paper."""
+    """Genera las preguntas de un paper (config.N_GENERADAS en total).
+
+    El reparto imagen/texto depende de cuántas figuras tenga el paper: se piden
+    config.PREGUNTAS_POR_FIGURA por figura, con el tope que impone el suelo de
+    preguntas de texto. Cuando no caben 3 por figura se reparten de forma
+    pareja entre todas para no dejar figuras sin usar."""
     ids_validos = paquete.figura_ids()
+    figura_ids = [f.figura_id for f in paquete.figuras]
+    n_imagen, n_texto = config.reparto_preguntas(len(figura_ids))
+    reparto = config.reparto_por_figura(figura_ids, n_imagen)
+
+    if reparto:
+        detalle = ", ".join(f"{fid}: {k}" for fid, k in reparto.items())
+        instruccion_figuras = (
+            f"De esas, EXACTAMENTE {n_imagen} deben ser de tipo 'imagen' y "
+            f"{n_texto} de tipo 'texto'.\n"
+            "Reparto obligatorio de las preguntas de imagen por figura "
+            f"(figura_id: nº de preguntas) -> {detalle}.\n"
+            "Cada figura debe recibir exactamente ese número de preguntas, y "
+            "las preguntas de una misma figura deben enfocar aspectos "
+            "distintos y tener respuestas distintas.\n"
+            "Si alguna de esas figuras no admite una pregunta honesta "
+            "(es un gráfico, una tabla o es ilegible), genera en su lugar "
+            "preguntas de tipo 'texto' hasta completar el total."
+        )
+    else:
+        instruccion_figuras = (
+            f"Este paper no tiene figuras utilizables: las {n_texto} preguntas "
+            "deben ser de tipo 'texto'."
+        )
+
     instruccion = (
-        "Genera ahora las 15 preguntas siguiendo TODAS las reglas. "
-        "Recuerda: son preguntas de anatomía general para alguien que nunca verá "
-        "este paper, y en las de tipo 'imagen' la figura es el estímulo, nunca "
-        "la respuesta. "
+        f"Genera ahora las {config.N_GENERADAS} preguntas siguiendo TODAS las "
+        "reglas. Recuerda: son preguntas de anatomía general para alguien que "
+        "nunca verá este paper, y en las de tipo 'imagen' la figura es el "
+        "estímulo, nunca la respuesta.\n"
+        f"{instruccion_figuras}\n"
         f"Figuras válidas: {sorted(ids_validos) or 'ninguna'}."
     )
     contenido, image_refs = _construir_contenido_paper(paquete, instruccion, dir_figuras)
@@ -210,22 +258,34 @@ def generar_preguntas(
         {"role": "user", "content": contenido},
     ]
 
-    logger.info("[%s] generando preguntas con %s...", paquete.paper_id, MODELO_GENERADOR)
+    logger.info(
+        "[%s] generando %d preguntas con %s (%d imagen sobre %d figuras, %d texto)...",
+        paquete.paper_id,
+        config.N_GENERADAS,
+        MODELO_GENERADOR,
+        n_imagen,
+        len(figura_ids),
+        n_texto,
+    )
     data = client.chat_json(
         model=MODELO_GENERADOR,
         messages=messages,
         temperature=TEMPERATURA,
+        max_tokens=config.MAX_TOKENS_GENERADOR,
         dump_base=dump_base,
         image_refs=image_refs,
     )
     data.setdefault("paper_id", paquete.paper_id)
     salida = SalidaGenerador.model_validate(data)
     salida = _sanear(salida, ids_validos)
+    obtenidas_imagen = sum(1 for p in salida.preguntas if p.tipo == "imagen")
     logger.info(
-        "[%s] generadas %d preguntas (%d de tipo imagen)",
+        "[%s] generadas %d/%d preguntas (%d de tipo imagen, pedidas %d)",
         paquete.paper_id,
         len(salida.preguntas),
-        sum(1 for p in salida.preguntas if p.tipo == "imagen"),
+        config.N_GENERADAS,
+        obtenidas_imagen,
+        n_imagen,
     )
     return salida
 
@@ -272,6 +332,7 @@ def corregir_preguntas(
         model=MODELO_GENERADOR,
         messages=messages,
         temperature=TEMPERATURA,
+        max_tokens=config.MAX_TOKENS_GENERADOR,
         dump_base=dump_base,
         image_refs=image_refs,
     )
@@ -286,6 +347,7 @@ def _sanear(
 ) -> SalidaGenerador:
     """Corrige inconsistencias obvias en la salida del LLM sin descartar
     preguntas (la validación dura está en la Etapa 3)."""
+    degradadas = 0
     for p in salida.preguntas:
         if p.tipo == "imagen":
             if not p.figura_id or p.figura_id not in ids_figuras_validas:
@@ -299,6 +361,15 @@ def _sanear(
                 )
                 p.tipo = "texto"
                 p.figura_id = None
+                degradadas += 1
         else:
             p.figura_id = None
+    if degradadas:
+        # Señal de que el generador está inventando figura_ids: cada
+        # degradación resta una pregunta de imagen del reparto pedido.
+        logger.info(
+            "[%s] %d preguntas de imagen degradadas a texto por figura_id inválido",
+            salida.paper_id,
+            degradadas,
+        )
     return salida

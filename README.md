@@ -18,10 +18,29 @@ el resto es código puro.
 | Etapa | Qué hace | LLM |
 |-------|----------|-----|
 | **0 — Preprocesamiento** | Extrae texto e imágenes (con caption y página) de cada PDF con PyMuPDF. Guarda las imágenes en `figuras/`. | No |
-| **1 — Generación** | Genera 15 preguntas abiertas breves por paper, usando texto + imágenes como input multimodal. | Sí (generador) |
-| **2 — Evaluación** | Verifica veracidad, calidad y dificultad de las 15 preguntas y selecciona las 10 mejores. | Sí (evaluador) |
-| **2.5 — Regeneración** | Si hay menos de 10 aprobadas, reenvía las "corregibles" al generador con el feedback del evaluador y las re-evalúa. Máximo 2 reintentos. | Sí |
+| **1 — Generación** | Genera 40 preguntas abiertas breves por paper, usando texto + imágenes como input multimodal. El reparto imagen/texto depende de las figuras del paper (ver abajo). | Sí (generador) |
+| **2 — Evaluación** | Verifica veracidad, calidad y dificultad de las 40 preguntas y selecciona las mejores, como máximo 25 (pueden ser menos). | Sí (evaluador) |
+| **2.5 — Regeneración** | Si hay menos de 25 aprobadas, reenvía las "corregibles" al generador con el feedback del evaluador y las re-evalúa. Máximo 2 reintentos. | Sí |
 | **3 — Validación** | Valida el formato de cada pregunta con Pydantic (campos, tipos, respuesta ≤ 5 palabras, figura existente, id único) y escribe el resultado. | No |
+
+### Cuántas preguntas de imagen se piden
+
+Los conteos viven en `src/config.py`. El generador siempre produce **40 preguntas** por
+paper; cuántas son de imagen depende de las figuras que tenga:
+
+- Se piden **3 preguntas por figura**, repartidas entre **todas** las figuras.
+- Se reservan siempre **al menos 8 preguntas de texto**, así que el tope de imagen es 32.
+- Cuando 3 por figura no caben en ese tope, se baja el número por figura (3 → 2 → 1) antes
+  que dejar figuras sin usar: 12 figuras dan 32 preguntas de imagen repartidas como 8
+  figuras con 3 y 4 figuras con 2.
+
+| Figuras del paper | Preguntas de imagen | Preguntas de texto |
+|---|---|---|
+| 0 | 0 | 40 |
+| 1 | 3 | 37 |
+| 6 | 18 | 22 |
+| 12 | 32 | 8 |
+| 20+ | 32 | 8 |
 
 La salida es **un archivo `.jsonl` por paper** en la carpeta de resultados, donde cada
 línea es una pregunta validada. Además, para **observabilidad**, cada llamada a un modelo

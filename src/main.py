@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import config
 from etapa0_preprocesamiento import preprocesar_carpeta
 from etapa1_generador import MODELO_GENERADOR, corregir_preguntas, generar_preguntas
 from etapa2_evaluador import MODELO_EVALUADOR, evaluar_preguntas
@@ -34,7 +35,7 @@ DIR_FIGURAS = Path("figuras")
 DIR_PAYLOADS = Path("payloads")
 DIR_SALIDA = Path("resultados")
 
-OBJETIVO_APROBADAS = 10
+OBJETIVO_APROBADAS = config.N_SELECCION_MAX
 MAX_REINTENTOS = 2
 
 
@@ -183,20 +184,18 @@ def procesar_paper(
     seleccion = seleccion[:OBJETIVO_APROBADAS]
 
     final = _contar_aprobadas(evaluaciones)
-    if len(seleccion) < OBJETIVO_APROBADAS:
-        logger.warning(
-            "[%s] solo %d preguntas aprobadas (objetivo %d); se registran las disponibles",
-            paquete.paper_id,
-            len(seleccion),
-            OBJETIVO_APROBADAS,
-        )
-    else:
-        logger.info(
-            "[%s] %d aprobadas; se seleccionan %d",
-            paquete.paper_id,
-            final,
-            len(seleccion),
-        )
+    # Seleccionar menos del máximo es un resultado válido: el evaluador no debe
+    # completar el cupo con preguntas débiles.
+    n_imagen_sel = sum(1 for pid in seleccion if preguntas[pid].tipo == "imagen")
+    logger.info(
+        "[%s] %d aprobadas; se seleccionan %d/%d (%d imagen, %d texto)",
+        paquete.paper_id,
+        final,
+        len(seleccion),
+        OBJETIVO_APROBADAS,
+        n_imagen_sel,
+        len(seleccion) - n_imagen_sel,
+    )
 
     # --- Etapa 3: validación de formato --------------------------------
     ids_globales: set[str] = set()  # unicidad se garantiza a nivel global fuera

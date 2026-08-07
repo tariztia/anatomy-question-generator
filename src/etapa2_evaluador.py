@@ -1,7 +1,7 @@
 """Etapa 2 — Evaluación (LLM: Gemini 3.1 Pro vía OpenRouter).
 
-Verifica veracidad, calidad y dificultad de las 15 preguntas y selecciona las
-10 mejores.
+Verifica veracidad, calidad y dificultad de las preguntas generadas y
+selecciona las mejores (como máximo config.N_SELECCION_MAX; pueden ser menos).
 """
 
 from __future__ import annotations
@@ -10,8 +10,10 @@ import json
 import logging
 import os
 from pathlib import Path
+from string import Template
 from typing import Any, Optional
 
+import config
 from openrouter_client import OpenRouterClient  # carga el .env al importarse
 from schemas import PaquetePaper, PreguntaGenerada, SalidaEvaluador
 
@@ -27,10 +29,10 @@ MODELO_EVALUADOR = os.getenv("MODELO_EVALUADOR", "openai/gpt-4o-mini")
 TEMPERATURA = 0.0
 MAX_CHARS_TEXTO = 60_000
 
-SYSTEM_PROMPT = """\
-Eres un evaluador experto en anatomía humana. Recibes un paper y 15 preguntas \
-abiertas breves generadas a partir de él. Debes evaluar cada pregunta con \
-rigor y seleccionar las 10 mejores.
+_SYSTEM_PROMPT_TMPL = Template("""\
+Eres un evaluador experto en anatomía humana. Recibes un paper y un conjunto de \
+preguntas abiertas breves generadas a partir de él. Debes evaluar cada pregunta \
+con rigor y seleccionar las mejores, como máximo $n_seleccion_max.
 
 Las preguntas alimentarán un dataset de entrenamiento de un modelo multimodal \
 de anatomía. El paper es solo la FUENTE del conocimiento y de las imágenes: las \
@@ -81,10 +83,13 @@ como "¿qué estructura/variante se observa en la imagen?"). Incluye \
 incorrecta, o la pregunta solo existe por ser un dato del estudio (una \
 estadística de la muestra no se puede convertir en pregunta de anatomía).
 
-SELECCIÓN FINAL: elige hasta 10 pregunta_ids, solo entre las "aprobada", \
-priorizando la mayor calidad, la variedad de temas y de ejes (identificación, \
-relaciones, variantes, correlato clínico) y una buena proporción de preguntas de \
-imagen. No completes la cuota con preguntas débiles.
+SELECCIÓN FINAL: elige COMO MÁXIMO $n_seleccion_max pregunta_ids, solo entre las \
+"aprobada", priorizando la mayor calidad, la variedad de temas y de ejes \
+(identificación, relaciones, variantes, correlato clínico) y una buena \
+proporción de preguntas de imagen. Seleccionar MENOS de $n_seleccion_max es un \
+resultado perfectamente válido y esperable: no completes el cupo con preguntas \
+débiles. Es preferible devolver 14 preguntas excelentes que $n_seleccion_max \
+con relleno. Ordena los ids de mejor a peor.
 
 Devuelve ÚNICAMENTE un objeto JSON con este formato:
 {
@@ -101,6 +106,11 @@ Devuelve ÚNICAMENTE un objeto JSON con este formato:
   ],
   "seleccion_final": {"pregunta_ids": ["q_01", "q_03"], "criterio_seleccion": "string"}
 }"""
+)
+
+SYSTEM_PROMPT = _SYSTEM_PROMPT_TMPL.substitute(
+    n_seleccion_max=config.N_SELECCION_MAX,
+)
 
 
 def _serializar_preguntas(preguntas: list[PreguntaGenerada]) -> str:
@@ -169,7 +179,7 @@ def evaluar_preguntas(
         OpenRouterClient.text_part(
             "\n=== PREGUNTAS A EVALUAR ===\n"
             + _serializar_preguntas(preguntas)
-            + "\n\nEvalúa las 15 y devuelve el JSON."
+            + f"\n\nEvalúa las {len(preguntas)} y devuelve el JSON."
         )
     )
 
@@ -178,11 +188,18 @@ def evaluar_preguntas(
         {"role": "user", "content": partes},
     ]
 
-    logger.info("[%s] evaluando con %s...", paquete.paper_id, MODELO_EVALUADOR)
+    logger.info(
+        "[%s] evaluando %d preguntas con %s (%d figuras adjuntas)...",
+        paquete.paper_id,
+        len(preguntas),
+        MODELO_EVALUADOR,
+        len(figuras),
+    )
     data = client.chat_json(
         model=MODELO_EVALUADOR,
         messages=messages,
         temperature=TEMPERATURA,
+        max_tokens=config.MAX_TOKENS_EVALUADOR,
         dump_base=dump_base,
         image_refs=image_refs,
     )
