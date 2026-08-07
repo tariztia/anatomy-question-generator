@@ -13,6 +13,7 @@ from string import Template
 from typing import Any, Optional
 
 import config
+from etapa0_preprocesamiento import ruta_figura
 from openrouter_client import OpenRouterClient  # carga el .env al importarse
 from schemas import PaquetePaper, PreguntaGenerada, SalidaGenerador
 
@@ -192,7 +193,7 @@ def _construir_contenido_paper(
             parte_img = OpenRouterClient.image_part(fig.imagen_base64)
             partes.append(parte_img)
             image_refs[parte_img["image_url"]["url"]] = str(
-                dir_figuras / f"{paquete.paper_id}_{fig.figura_id}.png"
+                ruta_figura(dir_figuras, paquete.paper_id, fig.figura_id)
             )
     else:
         partes.append(

@@ -2,7 +2,7 @@
 
 Recorre los PDFs de una carpeta y, para cada uno, extrae el texto completo y
 las imágenes con su caption, número de figura y página. Las imágenes se
-guardan como PNG en `figuras/{paper_id}_{figura_id}.png`.
+guardan como PNG en `figuras/{paper_id}/{figura_id}.png`, una carpeta por paper.
 """
 
 from __future__ import annotations
@@ -29,6 +29,15 @@ MIN_ALTO = 80
 # Los metadatos de muchos PDFs traen el nombre del archivo del maquetador
 # (p. ej. "rb2015v48n6p358-362_en.p65") en lugar del título del paper.
 NOMBRE_ARCHIVO_RE = re.compile(r"\.(p65|pdf|docx?|indd|qxd|qxp|fm|tex|ai|eps)$", re.I)
+
+
+def ruta_figura(dir_figuras: Path, paper_id: str, figura_id: str) -> Path:
+    """Ruta en disco de una figura: `{dir_figuras}/{paper_id}/{figura_id}.png`.
+
+    Fuente única de verdad del layout: las etapas 1 y 2 la usan para anotar en
+    los payloads qué archivo corresponde a cada imagen enviada al modelo.
+    """
+    return dir_figuras / paper_id / f"{figura_id}.png"
 
 
 def _titulo_plausible(titulo: str) -> bool:
@@ -172,8 +181,9 @@ def procesar_pdf(pdf_path: Path, dir_figuras: Path) -> PaquetePaper:
                 except Exception:  # noqa: BLE001
                     pass
 
-                nombre_archivo = f"{paper_id_safe}_{figura_id}.png"
-                (dir_figuras / nombre_archivo).write_bytes(png_bytes)
+                destino = ruta_figura(dir_figuras, paper_id_safe, figura_id)
+                destino.parent.mkdir(parents=True, exist_ok=True)
+                destino.write_bytes(png_bytes)
 
                 figuras.append(
                     Figura(

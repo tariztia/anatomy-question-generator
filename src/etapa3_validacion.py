@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from etapa0_preprocesamiento import ruta_figura
 from etapa1_generador import MODELO_GENERADOR
 from etapa2_evaluador import MODELO_EVALUADOR
 from schemas import (
@@ -52,13 +53,12 @@ def construir_registro(
             raise ValidacionError(
                 f"{pregunta_id_global}: tipo 'imagen' sin figura_id"
             )
-        nombre = f"{paquete.paper_id}_{pregunta.figura_id}.png"
-        ruta = dir_figuras / nombre
+        ruta = ruta_figura(dir_figuras, paquete.paper_id, pregunta.figura_id)
         if not ruta.exists():
             raise ValidacionError(
                 f"{pregunta_id_global}: figura_archivo no existe: {ruta}"
             )
-        figura_archivo = f"{dir_figuras.name}/{nombre}"
+        figura_archivo = f"{dir_figuras.name}/{paquete.paper_id}/{ruta.name}"
 
     metadata = MetadataRegistro(
         paper_id=paquete.paper_id,

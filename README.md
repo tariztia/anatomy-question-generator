@@ -172,7 +172,7 @@ Cada línea de `resultados/{paper_id}.jsonl` es una pregunta validada:
 ```
 
 Para preguntas de tipo `imagen`, `figura_archivo` apunta al PNG extraído
-(`figuras/{paper_id}_{figura_id}.png`).
+(`figuras/{paper_id}/{figura_id}.png`: una carpeta por paper).
 
 ---
 
@@ -195,7 +195,7 @@ payloads/{paper_id}/
 
 - El `request.json` contiene el prompt de sistema, el texto del paper y las preguntas tal
   como se mandaron. **Las imágenes no se guardan en base64**: se reemplazan por una
-  referencia al PNG real (`{"_archivo": "figuras/..._fig_1.png"}`), que puedes abrir
+  referencia al PNG real (`{"_archivo": "figuras/{paper_id}/fig_1.png"}`), que puedes abrir
   directamente. Esto no altera lo que se envía a OpenRouter, solo la copia en disco.
 - El `response.json` contiene la respuesta cruda del modelo (por ejemplo, los veredictos
   completos del evaluador, que no aparecen en el resultado final).
