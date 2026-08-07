@@ -29,6 +29,30 @@ MODELO_GENERADOR = os.getenv("MODELO_GENERADOR", "openai/gpt-4o-mini")
 TEMPERATURA = 0.7
 MAX_CHARS_TEXTO = 60_000  # recorte defensivo del texto del paper
 
+# Esquema de salida compartido por los dos system prompts (generación y
+# corrección). Vive en una constante porque cuando cada prompt lo describía por
+# su cuenta divergieron: el de corrección decía "el mismo formato del generador"
+# sin listar los campos, y el modelo devolvía preguntas sin "tema" ni
+# "dificultad_estimada".
+_ESQUEMA_SALIDA = """\
+{
+  "paper_id": "<paper_id>",
+  "preguntas": [
+    {
+      "pregunta_id": "q_01",
+      "pregunta": "string",
+      "respuesta": "string (1-5 palabras)",
+      "tipo": "texto" | "imagen",
+      "figura_id": "fig_1" | null,
+      "evidencia": "cita textual o referencia a figura",
+      "tema": "string (ej: 'osteología - miembro inferior')",
+      "dificultad_estimada": "baja" | "media" | "alta"
+    }
+  ]
+}
+Los ocho campos son OBLIGATORIOS en CADA pregunta; omitir uno invalida la \
+respuesta completa."""
+
 _SYSTEM_PROMPT_TMPL = Template("""\
 Eres un experto en anatomía humana y en diseño de evaluaciones. Usas papers \
 académicos como FUENTE DE CONOCIMIENTO para escribir preguntas de ANATOMÍA \
@@ -109,21 +133,7 @@ se ve en la imagen que justifica la respuesta.
 
 Devuelve ÚNICAMENTE un objeto JSON válido, sin texto adicional, con este \
 formato:
-{
-  "paper_id": "<paper_id>",
-  "preguntas": [
-    {
-      "pregunta_id": "q_01",
-      "pregunta": "string",
-      "respuesta": "string (1-5 palabras)",
-      "tipo": "texto" | "imagen",
-      "figura_id": "fig_1" | null,
-      "evidencia": "cita textual o referencia a figura",
-      "tema": "string (ej: 'osteología - miembro inferior')",
-      "dificultad_estimada": "baja" | "media" | "alta"
-    }
-  ]
-}
+$esquema
 Los pregunta_id van de "q_01" a "$id_max"."""
 )
 
@@ -131,6 +141,7 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT_TMPL.substitute(
     n_generadas=config.N_GENERADAS,
     id_max=f"q_{config.N_GENERADAS:02d}",
     n_alta=config.N_DIFICULTAD_ALTA,
+    esquema=_ESQUEMA_SALIDA,
 )
 
 SYSTEM_PROMPT_CORRECCION = """\
@@ -154,9 +165,12 @@ parafrasear.
 - Mantén el mismo "pregunta_id" de cada pregunta que corriges.
 - Si el feedback indica ambigüedad, haz la pregunta más específica y unívoca.
 - Respeta las reglas de "tipo"/"figura_id"/"evidencia".
+- Cada pregunta a corregir viene con su "tema" y su "dificultad_estimada" \
+originales: cópialos tal cual en tu respuesta, salvo que la corrección los \
+vuelva incorrectos.
 
-Devuelve ÚNICAMENTE un objeto JSON con el mismo formato del generador:
-{ "paper_id": "<paper_id>", "preguntas": [ ... ] }
+Devuelve ÚNICAMENTE un objeto JSON con este formato (el mismo del generador):
+""" + _ESQUEMA_SALIDA + """
 Incluye SOLO las preguntas corregidas."""
 
 
@@ -304,12 +318,15 @@ def corregir_preguntas(
         return []
 
     ids_validos = paquete.figura_ids()
+    originales = {p["pregunta_id"]: p for p in preguntas_a_corregir}
     lineas = []
     for p in preguntas_a_corregir:
         lineas.append(
             f"- pregunta_id: {p['pregunta_id']}\n"
             f"  pregunta_original: {p['pregunta_original']}\n"
             f"  respuesta_original: {p['respuesta_original']}\n"
+            f"  tema: {p.get('tema', '')}\n"
+            f"  dificultad_estimada: {p.get('dificultad_estimada', '')}\n"
             f"  feedback: {p['feedback']}"
         )
     instruccion = (
@@ -338,9 +355,37 @@ def corregir_preguntas(
         image_refs=image_refs,
     )
     data.setdefault("paper_id", paquete.paper_id)
+    _completar_campos_heredados(data, originales, paquete.paper_id)
     salida = SalidaGenerador.model_validate(data)
     salida = _sanear(salida, ids_validos)
     return salida.preguntas
+
+
+def _completar_campos_heredados(
+    data: dict[str, Any], originales: dict[str, dict[str, Any]], paper_id: str
+) -> None:
+    """Rellena in situ los campos que el corrector suele omitir por venir de la
+    pregunta original y no del feedback.
+
+    El prompt ya los pide explícitamente, pero un solo campo ausente hace
+    fallar la validación del lote entero y con él el paper completo. Como el
+    valor original es de todos modos la mejor fuente, se hereda en silencio.
+    """
+    for pregunta in data.get("preguntas") or []:
+        if not isinstance(pregunta, dict):
+            continue
+        original = originales.get(pregunta.get("pregunta_id"))
+        if original is None:
+            continue
+        for campo in ("tema", "dificultad_estimada"):
+            if not pregunta.get(campo) and original.get(campo):
+                logger.debug(
+                    "[%s] %s: '%s' ausente en la corrección; se hereda el original",
+                    paper_id,
+                    pregunta.get("pregunta_id"),
+                    campo,
+                )
+                pregunta[campo] = original[campo]
 
 
 def _sanear(

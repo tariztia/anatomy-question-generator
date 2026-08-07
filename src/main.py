@@ -119,6 +119,10 @@ def procesar_paper(
                 "pregunta_id": p.pregunta_id,
                 "pregunta_original": p.pregunta,
                 "respuesta_original": p.respuesta,
+                # El corrector los reutiliza tal cual salvo que el feedback los
+                # invalide; además sirven de fallback si no los devuelve.
+                "tema": p.tema,
+                "dificultad_estimada": p.dificultad_estimada,
                 "feedback": (
                     evaluaciones[p.pregunta_id].feedback_correccion
                     or evaluaciones[p.pregunta_id].veracidad.comentario
