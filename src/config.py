@@ -30,6 +30,15 @@ N_DIFICULTAD_ALTA = 10
 # debe completar el cupo con preguntas débiles.
 N_SELECCION_MAX = 25
 
+# --- Límites de entrada de los modelos -------------------------------------
+
+# Figuras (imágenes) que puede llevar UNA llamada. A partir de 21 imágenes
+# Anthropic baja el lado máximo permitido por imagen de 8000 a 2000 px y
+# rechaza la request entera con un 400. Se trocea en lotes en vez de reescalar
+# las figuras porque reescalar sí cuesta detalle: los tokens de imagen (y lo
+# que el modelo ve) escalan con los píxeles. Ver src/lotes.py.
+MAX_FIGURAS_POR_LLAMADA = 20
+
 # --- Límites de salida de los modelos --------------------------------------
 
 # Con 40 preguntas por paper la respuesta ronda los 8k tokens. Se fija un tope

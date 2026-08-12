@@ -31,9 +31,28 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_TIMEOUT = 180.0
 MAX_RETRIES = 4
 
+# Códigos que sí vale la pena reintentar (saturación o fallo pasajero del
+# proveedor). Cualquier otro 4xx es un problema del payload.
+CODIGOS_REINTENTABLES = frozenset({429, 500, 502, 503, 504})
+
 
 class OpenRouterError(RuntimeError):
     """Error irrecuperable tras agotar reintentos."""
+
+
+class ErrorAPIPermanente(OpenRouterError):
+    """La API rechazó la request de forma determinista (4xx, o un 200 cuyo
+    cuerpo trae "error" en vez de "choices").
+
+    No se reintenta: el mismo payload va a fallar igual las veces que haga
+    falta. Antes esto se veía como un KeyError('choices') que agotaba los 4
+    intentos y perdía por el camino el mensaje del proveedor, que es justo el
+    que dice qué hay que arreglar.
+    """
+
+
+class _ErrorTransitorio(Exception):
+    """Error recuperable señalado en el cuerpo de una respuesta 200."""
 
 
 class RespuestaTruncadaError(OpenRouterError):
@@ -129,14 +148,24 @@ class OpenRouterClient:
         for intento in range(1, self.max_retries + 1):
             try:
                 resp = self._client.post(OPENROUTER_URL, headers=headers, json=payload)
-                if resp.status_code in (429, 500, 502, 503, 504):
+                if resp.status_code in CODIGOS_REINTENTABLES:
                     raise httpx.HTTPStatusError(
                         f"HTTP {resp.status_code}",
                         request=resp.request,
                         response=resp,
                     )
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    codigo, mensaje = _detalle_error_http(resp)
+                    self._fallo_permanente(model, codigo, mensaje, dump_base)
                 data = resp.json()
+                # OpenRouter devuelve los errores del proveedor con HTTP 200 y
+                # un cuerpo {"error": {...}}, sin "choices".
+                error = _error_de_cuerpo(data)
+                if error is not None:
+                    codigo, mensaje = error
+                    if codigo in CODIGOS_REINTENTABLES:
+                        raise _ErrorTransitorio(f"HTTP {codigo}: {mensaje}")
+                    self._fallo_permanente(model, codigo, mensaje, dump_base)
                 choice = data["choices"][0]
                 content = choice["message"]["content"]
                 finish_reason = choice.get("finish_reason")
@@ -170,22 +199,53 @@ class OpenRouterClient:
                         + ". Sube el max_tokens de la etapa en config.py."
                     )
                 return content
-            except (httpx.HTTPStatusError, httpx.TransportError, KeyError, json.JSONDecodeError) as exc:
+            except (
+                httpx.HTTPStatusError,
+                httpx.TransportError,
+                KeyError,
+                json.JSONDecodeError,
+                _ErrorTransitorio,
+            ) as exc:
                 ultimo_error = exc
-                espera = min(2 ** intento, 30)
-                logger.warning(
-                    "OpenRouter intento %d/%d falló (%s). Reintentando en %ds...",
-                    intento,
-                    self.max_retries,
-                    exc,
-                    espera,
-                )
                 if intento < self.max_retries:
+                    espera = min(2 ** intento, 30)
+                    logger.warning(
+                        "OpenRouter intento %d/%d falló (%s). Reintentando en %ds...",
+                        intento,
+                        self.max_retries,
+                        exc,
+                        espera,
+                    )
                     time.sleep(espera)
+                else:
+                    logger.warning(
+                        "OpenRouter intento %d/%d falló (%s). Sin más reintentos.",
+                        intento,
+                        self.max_retries,
+                        exc,
+                    )
 
         raise OpenRouterError(
             f"Falló la llamada a OpenRouter (modelo={model}) tras "
             f"{self.max_retries} intentos: {ultimo_error}"
+        )
+
+    @staticmethod
+    def _fallo_permanente(
+        model: str,
+        codigo: Any,
+        mensaje: str,
+        dump_base: Optional[Path],
+    ) -> None:
+        """Registra el rechazo y aborta sin reintentar."""
+        if dump_base is not None:
+            _escribir_json(
+                Path(f"{dump_base}.error.json"),
+                {"model": model, "code": codigo, "error": mensaje},
+            )
+        raise ErrorAPIPermanente(
+            f"OpenRouter rechazó la request (modelo={model}, code={codigo}): "
+            f"{mensaje}"
         )
 
     def chat_json(
@@ -224,6 +284,39 @@ def _escribir_json(path: Path, obj: Any) -> None:
     """Escribe `obj` como JSON legible, creando la carpeta si hace falta."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _detalle_error_http(resp: httpx.Response) -> tuple[Any, str]:
+    """(código, mensaje) de una respuesta 4xx, prefiriendo el cuerpo JSON."""
+    try:
+        error = _error_de_cuerpo(resp.json())
+    except (json.JSONDecodeError, ValueError):
+        error = None
+    if error is not None:
+        codigo, mensaje = error
+        return codigo or resp.status_code, mensaje
+    return resp.status_code, resp.text[:2000]
+
+
+def _error_de_cuerpo(data: Any) -> Optional[tuple[Any, str]]:
+    """Devuelve (código, mensaje) si el cuerpo trae un error, o None.
+
+    El detalle útil suele venir en `error.metadata.raw` (el mensaje crudo del
+    proveedor), no en `error.message`, así que se concatenan los dos.
+    """
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    if not error:
+        return None
+    if not isinstance(error, dict):
+        return None, str(error)
+
+    mensaje = str(error.get("message") or json.dumps(error, ensure_ascii=False))
+    metadata = error.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("raw"):
+        mensaje = f"{mensaje} | {metadata['raw']}"
+    return error.get("code"), mensaje
 
 
 def _quizas_json(raw: str) -> Any:

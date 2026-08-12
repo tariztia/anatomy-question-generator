@@ -119,6 +119,10 @@ def procesar_paper(
                 "pregunta_id": p.pregunta_id,
                 "pregunta_original": p.pregunta,
                 "respuesta_original": p.respuesta,
+                # Con tipo y figura_id el corrector adjunta solo las figuras
+                # que estas preguntas usan, en vez de las del paper entero.
+                "tipo": p.tipo,
+                "figura_id": p.figura_id,
                 # El corrector los reutiliza tal cual salvo que el feedback los
                 # invalide; además sirven de fallback si no los devuelve.
                 "tema": p.tema,

@@ -9,14 +9,21 @@ from __future__ import annotations
 import json
 import logging
 import os
+from itertools import zip_longest
 from pathlib import Path
 from string import Template
 from typing import Any, Optional
 
 import config
+import lotes as lotes_mod
 from etapa0_preprocesamiento import ruta_figura
 from openrouter_client import OpenRouterClient  # carga el .env al importarse
-from schemas import PaquetePaper, PreguntaGenerada, SalidaEvaluador
+from schemas import (
+    PaquetePaper,
+    PreguntaGenerada,
+    SalidaEvaluador,
+    SeleccionFinal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,9 +116,12 @@ Devuelve ÚNICAMENTE un objeto JSON con este formato:
 }"""
 )
 
-SYSTEM_PROMPT = _SYSTEM_PROMPT_TMPL.substitute(
-    n_seleccion_max=config.N_SELECCION_MAX,
-)
+def _system_prompt(n_seleccion_max: int) -> str:
+    """El cupo de selección es por LOTE: cuando las figuras no caben en una
+    request, la evaluación se reparte en varias llamadas y cada una debe
+    proponer solo su parte del cupo, o entre todas seleccionarían muy por
+    encima de config.N_SELECCION_MAX."""
+    return _SYSTEM_PROMPT_TMPL.substitute(n_seleccion_max=n_seleccion_max)
 
 
 def _serializar_preguntas(preguntas: list[PreguntaGenerada]) -> str:
@@ -145,7 +155,96 @@ def evaluar_preguntas(
     dir_figuras: Path,
     dump_base: Optional[Path] = None,
 ) -> SalidaEvaluador:
-    """Evalúa las preguntas de un paper y devuelve la salida del evaluador."""
+    """Evalúa las preguntas de un paper y devuelve la salida del evaluador.
+
+    Si las figuras que las preguntas referencian no caben en una sola request
+    (config.MAX_FIGURAS_POR_LLAMADA), la evaluación se trocea: las preguntas de
+    una misma figura viajan siempre juntas y el cupo de selección se reparte
+    entre los lotes."""
+    grupos = lotes_mod.lotes_por_figura(
+        preguntas,
+        lambda p: p.figura_id if p.tipo == "imagen" else None,
+        config.MAX_FIGURAS_POR_LLAMADA,
+    )
+    logger.info(
+        "[%s] evaluando %d preguntas con %s en %d llamada(s)...",
+        paquete.paper_id,
+        len(preguntas),
+        MODELO_EVALUADOR,
+        len(grupos),
+    )
+
+    evaluaciones = []
+    selecciones: list[list[str]] = []
+    criterios: list[str] = []
+    for i, grupo in enumerate(grupos, start=1):
+        if not grupo:
+            continue
+        base = dump_base
+        if base is not None and len(grupos) > 1:
+            base = Path(f"{dump_base}_lote{i}")
+        # Cupo proporcional al tamaño del lote; el orquestador aplica el tope
+        # global sobre la lista ya mezclada.
+        cupo = max(
+            1, round(config.N_SELECCION_MAX * len(grupo) / max(len(preguntas), 1))
+        )
+        salida_lote = _evaluar_lote(
+            client, paquete, grupo, dir_figuras, base, cupo, i, len(grupos)
+        )
+        evaluaciones.extend(salida_lote.evaluaciones)
+        selecciones.append(list(salida_lote.seleccion_final.pregunta_ids))
+        if salida_lote.seleccion_final.criterio_seleccion:
+            criterios.append(salida_lote.seleccion_final.criterio_seleccion)
+
+    salida = SalidaEvaluador(
+        paper_id=paquete.paper_id,
+        evaluaciones=evaluaciones,
+        seleccion_final=SeleccionFinal(
+            pregunta_ids=_intercalar(selecciones),
+            criterio_seleccion=" | ".join(criterios),
+        ),
+    )
+
+    conteo = {"aprobada": 0, "corregible": 0, "rechazada": 0}
+    for e in salida.evaluaciones:
+        conteo[e.veredicto] = conteo.get(e.veredicto, 0) + 1
+    logger.info(
+        "[%s] evaluación: %d aprobadas, %d corregibles, %d rechazadas",
+        paquete.paper_id,
+        conteo["aprobada"],
+        conteo["corregible"],
+        conteo["rechazada"],
+    )
+    return salida
+
+
+def _intercalar(selecciones: list[list[str]]) -> list[str]:
+    """Mezcla en round-robin las selecciones de cada lote.
+
+    Cada lote ordena de mejor a peor solo lo que vio. Concatenar dejaría que el
+    primer lote copara el cupo global y sesgaría el dataset hacia sus figuras;
+    intercalar reparte el cupo respetando el orden interno de cada lote."""
+    mezcla: list[str] = []
+    vistos: set[str] = set()
+    for fila in zip_longest(*selecciones):
+        for pregunta_id in fila:
+            if pregunta_id and pregunta_id not in vistos:
+                vistos.add(pregunta_id)
+                mezcla.append(pregunta_id)
+    return mezcla
+
+
+def _evaluar_lote(
+    client: OpenRouterClient,
+    paquete: PaquetePaper,
+    preguntas: list[PreguntaGenerada],
+    dir_figuras: Path,
+    dump_base: Optional[Path],
+    n_seleccion_max: int,
+    i_lote: int,
+    n_lotes: int,
+) -> SalidaEvaluador:
+    """Una llamada de evaluación sobre un subconjunto de preguntas."""
     texto = paquete.texto_completo[:MAX_CHARS_TEXTO]
 
     partes: list[dict[str, Any]] = [
@@ -185,16 +284,18 @@ def evaluar_preguntas(
     )
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": _system_prompt(n_seleccion_max)},
         {"role": "user", "content": partes},
     ]
 
     logger.info(
-        "[%s] evaluando %d preguntas con %s (%d figuras adjuntas)...",
+        "[%s] lote %d/%d: %d preguntas, %d figuras adjuntas, cupo %d",
         paquete.paper_id,
+        i_lote,
+        n_lotes,
         len(preguntas),
-        MODELO_EVALUADOR,
         len(figuras),
+        n_seleccion_max,
     )
     data = client.chat_json(
         model=MODELO_EVALUADOR,
@@ -205,16 +306,4 @@ def evaluar_preguntas(
         image_refs=image_refs,
     )
     data.setdefault("paper_id", paquete.paper_id)
-    salida = SalidaEvaluador.model_validate(data)
-
-    conteo = {"aprobada": 0, "corregible": 0, "rechazada": 0}
-    for e in salida.evaluaciones:
-        conteo[e.veredicto] = conteo.get(e.veredicto, 0) + 1
-    logger.info(
-        "[%s] evaluación: %d aprobadas, %d corregibles, %d rechazadas",
-        paquete.paper_id,
-        conteo["aprobada"],
-        conteo["corregible"],
-        conteo["rechazada"],
-    )
-    return salida
+    return SalidaEvaluador.model_validate(data)

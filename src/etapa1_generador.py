@@ -13,9 +13,10 @@ from string import Template
 from typing import Any, Optional
 
 import config
+import lotes as lotes_mod
 from etapa0_preprocesamiento import ruta_figura
 from openrouter_client import OpenRouterClient  # carga el .env al importarse
-from schemas import PaquetePaper, PreguntaGenerada, SalidaGenerador
+from schemas import Figura, PaquetePaper, PreguntaGenerada, SalidaGenerador
 
 logger = logging.getLogger(__name__)
 
@@ -137,12 +138,20 @@ $esquema
 Los pregunta_id van de "q_01" a "$id_max"."""
 )
 
-SYSTEM_PROMPT = _SYSTEM_PROMPT_TMPL.substitute(
-    n_generadas=config.N_GENERADAS,
-    id_max=f"q_{config.N_GENERADAS:02d}",
-    n_alta=config.N_DIFICULTAD_ALTA,
-    esquema=_ESQUEMA_SALIDA,
-)
+def _system_prompt(n_preguntas: int, n_alta: int) -> str:
+    """El prompt se arma por llamada porque los conteos son por LOTE.
+
+    Cuando un paper tiene más figuras de las que caben en una request (ver
+    config.MAX_FIGURAS_POR_LLAMADA), la generación se reparte en varias
+    llamadas y cada una pide su propia cuota de preguntas; pedirle 40 a cada
+    lote multiplicaría el total.
+    """
+    return _SYSTEM_PROMPT_TMPL.substitute(
+        n_generadas=n_preguntas,
+        id_max=f"q_{n_preguntas:02d}",
+        n_alta=n_alta,
+        esquema=_ESQUEMA_SALIDA,
+    )
 
 SYSTEM_PROMPT_CORRECCION = """\
 Eres un experto en anatomía humana. Recibes preguntas que fueron rechazadas o \
@@ -175,10 +184,16 @@ Incluye SOLO las preguntas corregidas."""
 
 
 def _construir_contenido_paper(
-    paquete: PaquetePaper, instruccion_final: str, dir_figuras: Path
+    paquete: PaquetePaper,
+    figuras: list[Figura],
+    instruccion_final: str,
+    dir_figuras: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Construye el contenido multimodal (texto + figuras) y el mapa de
-    referencias imagen->ruta PNG para el volcado de observabilidad."""
+    referencias imagen->ruta PNG para el volcado de observabilidad.
+
+    `figuras` son las que viajan en ESTA llamada, no necesariamente todas las
+    del paper: el límite de imágenes por request obliga a repartirlas."""
     texto = paquete.texto_completo[:MAX_CHARS_TEXTO]
 
     partes: list[dict[str, Any]] = [
@@ -190,7 +205,7 @@ def _construir_contenido_paper(
     ]
     image_refs: dict[str, str] = {}
 
-    if paquete.figuras:
+    if figuras:
         partes.append(
             OpenRouterClient.text_part(
                 "\n=== FIGURAS DEL PAPER ===\n"
@@ -198,7 +213,7 @@ def _construir_contenido_paper(
                 "Úsalas para las preguntas de tipo 'imagen'."
             )
         )
-        for fig in paquete.figuras:
+        for fig in figuras:
             partes.append(
                 OpenRouterClient.text_part(
                     f"[{fig.figura_id}] (página {fig.pagina}) caption: {fig.caption or '(sin caption)'}"
@@ -232,14 +247,94 @@ def generar_preguntas(
     El reparto imagen/texto depende de cuántas figuras tenga el paper: se piden
     config.PREGUNTAS_POR_FIGURA por figura, con el tope que impone el suelo de
     preguntas de texto. Cuando no caben 3 por figura se reparten de forma
-    pareja entre todas para no dejar figuras sin usar."""
-    ids_validos = paquete.figura_ids()
+    pareja entre todas para no dejar figuras sin usar.
+
+    Si las figuras no caben en una sola request (config.MAX_FIGURAS_POR_LLAMADA)
+    la generación se trocea en varias llamadas, cada una con su cuota de
+    preguntas y sus figuras a resolución nativa. Los pregunta_id se renumeran al
+    final porque cada lote numera desde q_01."""
     figura_ids = [f.figura_id for f in paquete.figuras]
     n_imagen, n_texto = config.reparto_preguntas(len(figura_ids))
     reparto = config.reparto_por_figura(figura_ids, n_imagen)
 
-    if reparto:
-        detalle = ", ".join(f"{fid}: {k}" for fid, k in reparto.items())
+    # Solo viajan las figuras que reciben preguntas: las que el reparto deja a
+    # cero serían tokens de imagen pagados para nada.
+    figuras_usadas = [f for f in paquete.figuras if reparto.get(f.figura_id)]
+    grupos = lotes_mod.dividir_en_lotes(
+        figuras_usadas, config.MAX_FIGURAS_POR_LLAMADA
+    ) or [[]]
+
+    logger.info(
+        "[%s] generando %d preguntas con %s (%d imagen sobre %d figuras, %d texto)"
+        " en %d llamada(s)...",
+        paquete.paper_id,
+        config.N_GENERADAS,
+        MODELO_GENERADOR,
+        n_imagen,
+        len(figura_ids),
+        n_texto,
+        len(grupos),
+    )
+
+    preguntas: list[PreguntaGenerada] = []
+    for i, grupo in enumerate(grupos, start=1):
+        n_imagen_lote = sum(reparto[f.figura_id] for f in grupo)
+        # Las preguntas de texto van enteras en la primera llamada: no dependen
+        # de ninguna figura y así la suma de los lotes sigue dando N_GENERADAS.
+        n_texto_lote = n_texto if i == 1 else 0
+        if n_imagen_lote + n_texto_lote <= 0:
+            continue
+        base = dump_base
+        if base is not None and len(grupos) > 1:
+            base = Path(f"{dump_base}_lote{i}")
+        preguntas.extend(
+            _generar_lote(
+                client=client,
+                paquete=paquete,
+                figuras=grupo,
+                reparto=reparto,
+                n_imagen=n_imagen_lote,
+                n_texto=n_texto_lote,
+                dir_figuras=dir_figuras,
+                dump_base=base,
+                i_lote=i,
+                n_lotes=len(grupos),
+            )
+        )
+
+    salida = SalidaGenerador(
+        paper_id=paquete.paper_id, preguntas=_renumerar(preguntas)
+    )
+    obtenidas_imagen = sum(1 for p in salida.preguntas if p.tipo == "imagen")
+    logger.info(
+        "[%s] generadas %d/%d preguntas (%d de tipo imagen, pedidas %d)",
+        paquete.paper_id,
+        len(salida.preguntas),
+        config.N_GENERADAS,
+        obtenidas_imagen,
+        n_imagen,
+    )
+    return salida
+
+
+def _generar_lote(
+    client: OpenRouterClient,
+    paquete: PaquetePaper,
+    figuras: list[Figura],
+    reparto: dict[str, int],
+    n_imagen: int,
+    n_texto: int,
+    dir_figuras: Path,
+    dump_base: Optional[Path],
+    i_lote: int,
+    n_lotes: int,
+) -> list[PreguntaGenerada]:
+    """Una llamada de generación sobre un subconjunto de figuras."""
+    n_total = n_imagen + n_texto
+    ids_validos = {f.figura_id for f in figuras}
+
+    if figuras:
+        detalle = ", ".join(f"{f.figura_id}: {reparto[f.figura_id]}" for f in figuras)
         instruccion_figuras = (
             f"De esas, EXACTAMENTE {n_imagen} deben ser de tipo 'imagen' y "
             f"{n_texto} de tipo 'texto'.\n"
@@ -259,29 +354,33 @@ def generar_preguntas(
         )
 
     instruccion = (
-        f"Genera ahora las {config.N_GENERADAS} preguntas siguiendo TODAS las "
+        f"Genera ahora las {n_total} preguntas siguiendo TODAS las "
         "reglas. Recuerda: son preguntas de anatomía general para alguien que "
         "nunca verá este paper, y en las de tipo 'imagen' la figura es el "
         "estímulo, nunca la respuesta.\n"
         f"{instruccion_figuras}\n"
         f"Figuras válidas: {sorted(ids_validos) or 'ninguna'}."
     )
-    contenido, image_refs = _construir_contenido_paper(paquete, instruccion, dir_figuras)
+    contenido, image_refs = _construir_contenido_paper(
+        paquete, figuras, instruccion, dir_figuras
+    )
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": _system_prompt(n_total, _n_alta(n_total))},
         {"role": "user", "content": contenido},
     ]
 
-    logger.info(
-        "[%s] generando %d preguntas con %s (%d imagen sobre %d figuras, %d texto)...",
-        paquete.paper_id,
-        config.N_GENERADAS,
-        MODELO_GENERADOR,
-        n_imagen,
-        len(figura_ids),
-        n_texto,
-    )
+    if n_lotes > 1:
+        logger.info(
+            "[%s] lote %d/%d: %d figuras -> %d preguntas (%d imagen, %d texto)",
+            paquete.paper_id,
+            i_lote,
+            n_lotes,
+            len(figuras),
+            n_total,
+            n_imagen,
+            n_texto,
+        )
     data = client.chat_json(
         model=MODELO_GENERADOR,
         messages=messages,
@@ -292,17 +391,27 @@ def generar_preguntas(
     )
     data.setdefault("paper_id", paquete.paper_id)
     salida = SalidaGenerador.model_validate(data)
-    salida = _sanear(salida, ids_validos)
-    obtenidas_imagen = sum(1 for p in salida.preguntas if p.tipo == "imagen")
-    logger.info(
-        "[%s] generadas %d/%d preguntas (%d de tipo imagen, pedidas %d)",
-        paquete.paper_id,
-        len(salida.preguntas),
-        config.N_GENERADAS,
-        obtenidas_imagen,
-        n_imagen,
-    )
-    return salida
+    # Solo son válidas las figuras de ESTE lote: el modelo no ha visto las
+    # demás, así que una referencia a ellas sería inventada.
+    return _sanear(salida, ids_validos).preguntas
+
+
+def _n_alta(n_preguntas: int) -> int:
+    """Cuota de dificultad alta del lote, proporcional a la del paper."""
+    if n_preguntas <= 0:
+        return 0
+    cuota = round(config.N_DIFICULTAD_ALTA * n_preguntas / config.N_GENERADAS)
+    return max(1, min(cuota, n_preguntas))
+
+
+def _renumerar(preguntas: list[PreguntaGenerada]) -> list[PreguntaGenerada]:
+    """Reasigna pregunta_id correlativos sobre el conjunto del paper.
+
+    Cada lote numera desde "q_01", así que sin esto dos lotes colisionarían y
+    las preguntas se pisarían al indexarlas por id en el orquestador."""
+    for n, pregunta in enumerate(preguntas, start=1):
+        pregunta.pregunta_id = f"q_{n:02d}"
+    return preguntas
 
 
 def corregir_preguntas(
@@ -313,11 +422,56 @@ def corregir_preguntas(
     dump_base: Optional[Path] = None,
 ) -> list[PreguntaGenerada]:
     """Reenvía preguntas corregibles al generador con el feedback del
-    evaluador. Devuelve la lista de preguntas corregidas."""
+    evaluador. Devuelve la lista de preguntas corregidas.
+
+    Cada dict debe traer "tipo" y "figura_id": con ellos solo se adjuntan las
+    figuras que las preguntas realmente usan (antes viajaban las 34 de un paper
+    para corregir tres preguntas de texto) y se trocea en lotes si esas figuras
+    pasan de config.MAX_FIGURAS_POR_LLAMADA."""
     if not preguntas_a_corregir:
         return []
 
-    ids_validos = paquete.figura_ids()
+    grupos = lotes_mod.lotes_por_figura(
+        preguntas_a_corregir,
+        lambda p: p.get("figura_id") if p.get("tipo") == "imagen" else None,
+        config.MAX_FIGURAS_POR_LLAMADA,
+    )
+    logger.info(
+        "[%s] corrigiendo %d preguntas en %d llamada(s)...",
+        paquete.paper_id,
+        len(preguntas_a_corregir),
+        len(grupos),
+    )
+
+    corregidas: list[PreguntaGenerada] = []
+    for i, grupo in enumerate(grupos, start=1):
+        if not grupo:
+            continue
+        base = dump_base
+        if base is not None and len(grupos) > 1:
+            base = Path(f"{dump_base}_lote{i}")
+        corregidas.extend(
+            _corregir_lote(client, paquete, grupo, dir_figuras, base)
+        )
+    return corregidas
+
+
+def _corregir_lote(
+    client: OpenRouterClient,
+    paquete: PaquetePaper,
+    preguntas_a_corregir: list[dict[str, Any]],
+    dir_figuras: Path,
+    dump_base: Optional[Path],
+) -> list[PreguntaGenerada]:
+    """Una llamada de corrección; solo adjunta las figuras que se usan."""
+    ids_referenciados = {
+        p["figura_id"]
+        for p in preguntas_a_corregir
+        if p.get("tipo") == "imagen" and p.get("figura_id")
+    }
+    figuras = [f for f in paquete.figuras if f.figura_id in ids_referenciados]
+    ids_validos = {f.figura_id for f in figuras}
+
     originales = {p["pregunta_id"]: p for p in preguntas_a_corregir}
     lineas = []
     for p in preguntas_a_corregir:
@@ -325,27 +479,27 @@ def corregir_preguntas(
             f"- pregunta_id: {p['pregunta_id']}\n"
             f"  pregunta_original: {p['pregunta_original']}\n"
             f"  respuesta_original: {p['respuesta_original']}\n"
+            f"  tipo: {p.get('tipo', '')}\n"
+            f"  figura_id: {p.get('figura_id') or 'null'}\n"
             f"  tema: {p.get('tema', '')}\n"
             f"  dificultad_estimada: {p.get('dificultad_estimada', '')}\n"
             f"  feedback: {p['feedback']}"
         )
     instruccion = (
-        "Corrige las siguientes preguntas según su feedback. "
+        "Corrige las siguientes preguntas según su feedback. Cada pregunta de "
+        "tipo 'imagen' debe conservar su figura_id.\n"
         f"Figuras válidas: {sorted(ids_validos) or 'ninguna'}.\n\n"
         "PREGUNTAS A CORREGIR:\n" + "\n".join(lineas)
     )
-    contenido, image_refs = _construir_contenido_paper(paquete, instruccion, dir_figuras)
+    contenido, image_refs = _construir_contenido_paper(
+        paquete, figuras, instruccion, dir_figuras
+    )
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT_CORRECCION},
         {"role": "user", "content": contenido},
     ]
 
-    logger.info(
-        "[%s] corrigiendo %d preguntas...",
-        paquete.paper_id,
-        len(preguntas_a_corregir),
-    )
     data = client.chat_json(
         model=MODELO_GENERADOR,
         messages=messages,
