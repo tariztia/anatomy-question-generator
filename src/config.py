@@ -71,8 +71,8 @@ def reparto_por_figura(
     """Reparte `n_imagen` preguntas entre las figuras lo más parejo posible.
 
     Cuando no alcanzan 3 por figura se prefiere cubrir TODAS las figuras con
-    menos preguntas cada una antes que dar 3 a unas pocas: con 12 figuras y 32
-    preguntas salen 8 figuras con 3 y 4 figuras con 2. Las figuras que quedan
+    menos preguntas cada una antes que dar 3 a unas pocas: con 12 figuras y 35
+    preguntas salen 11 figuras con 3 y 1 figura con 2. Las figuras que quedan
     a cero (solo si hay más figuras que preguntas) se omiten del reparto.
     """
     n = len(figura_ids)
