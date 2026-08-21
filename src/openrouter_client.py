@@ -55,6 +55,16 @@ class _ErrorTransitorio(Exception):
     """Error recuperable señalado en el cuerpo de una respuesta 200."""
 
 
+class RespuestaVaciaError(OpenRouterError):
+    """El modelo terminó sin error pero `message.content` vino vacío.
+
+    Pasa con los modelos de razonamiento cuando todo el output se queda en el
+    campo `reasoning` y no llega a emitirse la respuesta. No se reintenta: la
+    generación ya consumió tokens (y minutos) y volver a pedir lo mismo suele
+    dar igual; hay que subir max_tokens o cambiar de modelo.
+    """
+
+
 class RespuestaTruncadaError(OpenRouterError):
     """El modelo agotó max_tokens y devolvió una respuesta incompleta.
 
@@ -167,21 +177,25 @@ class OpenRouterClient:
                         raise _ErrorTransitorio(f"HTTP {codigo}: {mensaje}")
                     self._fallo_permanente(model, codigo, mensaje, dump_base)
                 choice = data["choices"][0]
-                content = choice["message"]["content"]
+                mensaje = choice.get("message") or {}
+                content = _texto_de_content(mensaje.get("content"))
+                razonamiento = mensaje.get("reasoning")
                 finish_reason = choice.get("finish_reason")
                 uso = data.get("usage") or {}
                 if dump_base is not None:
                     # finish_reason y usage se guardan siempre: sin ellos, una
                     # respuesta truncada solo se ve como un JSON corrupto.
-                    _escribir_json(
-                        Path(f"{dump_base}.response.json"),
-                        {
-                            "model": model,
-                            "finish_reason": finish_reason,
-                            "usage": uso,
-                            "respuesta": _quizas_json(content),
-                        },
-                    )
+                    registro: dict[str, Any] = {
+                        "model": model,
+                        "finish_reason": finish_reason,
+                        "usage": uso,
+                        "respuesta": _quizas_json(content),
+                    }
+                    if not content.strip() and razonamiento:
+                        # Sin contenido, lo único que explica qué hizo el
+                        # modelo durante la llamada es el razonamiento.
+                        registro["razonamiento"] = razonamiento
+                    _escribir_json(Path(f"{dump_base}.response.json"), registro)
                 if finish_reason == "length":
                     razonamiento = (uso.get("completion_tokens_details") or {}).get(
                         "reasoning_tokens"
@@ -198,11 +212,26 @@ class OpenRouterClient:
                         )
                         + ". Sube el max_tokens de la etapa en config.py."
                     )
+                if not content.strip():
+                    if razonamiento:
+                        raise RespuestaVaciaError(
+                            f"El modelo {model} terminó "
+                            f"(finish_reason={finish_reason!r}) sin contenido: "
+                            "todo el output se quedó en el campo 'reasoning' "
+                            f"({uso.get('completion_tokens')} tokens de salida). "
+                            "Sube el max_tokens de la etapa en config.py o usa "
+                            "otro modelo."
+                        )
+                    raise _ErrorTransitorio(
+                        f"El modelo {model} devolvió contenido vacío "
+                        f"(finish_reason={finish_reason!r})"
+                    )
                 return content
             except (
                 httpx.HTTPStatusError,
                 httpx.TransportError,
                 KeyError,
+                IndexError,
                 json.JSONDecodeError,
                 _ErrorTransitorio,
             ) as exc:
@@ -319,6 +348,25 @@ def _error_de_cuerpo(data: Any) -> Optional[tuple[Any, str]]:
     return error.get("code"), mensaje
 
 
+def _texto_de_content(content: Any) -> str:
+    """Normaliza `message.content` a texto.
+
+    Algunos proveedores devuelven None (cuando no llegaron a emitir respuesta)
+    y otros una lista de partes {"type": "text", ...} en vez de un string.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            parte.get("text", "")
+            for parte in content
+            if isinstance(parte, dict)
+        )
+    return str(content)
+
+
 def _quizas_json(raw: str) -> Any:
     """Devuelve el contenido parseado como JSON si se puede; si no, el texto
     crudo. Sirve para que la respuesta guardada sea legible."""
@@ -352,6 +400,8 @@ def _sanitizar_messages(
 
 def _parse_json_laxo(raw: str) -> dict[str, Any]:
     """Parsea JSON tolerando fences de markdown y texto circundante."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("La respuesta del modelo no trae texto que parsear")
     texto = raw.strip()
     if texto.startswith("```"):
         # Quita ```json ... ``` o ``` ... ```

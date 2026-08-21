@@ -19,7 +19,7 @@ PREGUNTAS_POR_FIGURA = 3
 
 # Suelo de preguntas de texto: aunque el paper tenga muchas figuras, siempre se
 # reservan al menos estas para tipo "texto".
-MIN_PREGUNTAS_TEXTO = 8
+MIN_PREGUNTAS_TEXTO = 5
 
 # Preguntas de dificultad "alta" que se exigen (proporcional a N_GENERADAS).
 N_DIFICULTAD_ALTA = 10
@@ -28,7 +28,7 @@ N_DIFICULTAD_ALTA = 10
 
 # Tope de preguntas seleccionadas por paper. Pueden ser menos: el evaluador no
 # debe completar el cupo con preguntas débiles.
-N_SELECCION_MAX = 25
+N_SELECCION_MAX = 30
 
 # --- Límites de entrada de los modelos -------------------------------------
 
@@ -44,7 +44,7 @@ MAX_FIGURAS_POR_LLAMADA = 20
 # Con 40 preguntas por paper la respuesta ronda los 8k tokens. Se fija un tope
 # explícito y holgado porque el default del proveedor puede ser mucho menor, y
 # una respuesta truncada es JSON inválido que consume todos los reintentos.
-MAX_TOKENS_GENERADOR = 16_000
+MAX_TOKENS_GENERADOR = 32_000
 
 # El evaluador necesita bastante más que el generador: en los modelos de
 # razonamiento los tokens de thinking cuentan contra max_tokens y no aparecen

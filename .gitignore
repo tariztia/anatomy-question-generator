@@ -12,3 +12,5 @@ resultados/
 resultados_test/
 dataset.jsonl
 dataset_test.jsonl
+papers/
+papers_test/
